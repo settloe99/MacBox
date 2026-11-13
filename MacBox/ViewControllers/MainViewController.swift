@@ -25,21 +25,25 @@ class MainViewController: NSViewController {
     @IBOutlet weak var statusButton: NSButton!
     @IBOutlet weak var vmNameTextField: NSTextField!
     @IBOutlet var vmDescriptionTextView: NSTextView!
-    
+
     @IBOutlet weak var vmSpecMachine: NSTextField!
     @IBOutlet weak var vmSpecCPU: NSTextField!
     @IBOutlet weak var vmSpecRAM: NSTextField!
     @IBOutlet weak var vmSpecHDD: NSTextField!
     @IBOutlet weak var vmSpecMachineLogo: NSImageView!
-    
+
     // Instance
     private(set) static var instance: MainViewController!
-    
+
     // Variables
     let screensaverManager = ScreensaverManager()
     private let userDefaults = UserDefaults.standard
     private let fileManager = FileManager.default
-    var homeDirURL = URL(fileURLWithPath: "MacBox", isDirectory: true, relativeTo: FileManager.default.homeDirectoryForCurrentUser)
+    #if DEBUG
+        var homeDirURL = URL(fileURLWithPath: "MacBox-Dev", isDirectory: true, relativeTo: FileManager.default.homeDirectoryForCurrentUser)
+    #else
+        var homeDirURL = URL(fileURLWithPath: "MacBox", isDirectory: true, relativeTo: FileManager.default.homeDirectoryForCurrentUser)
+    #endif
     var vmList: [VM] = []
     private var currentSelectedVM: Int?
     private var currentRunningVM: [RunningVMProcess] = []
@@ -58,12 +62,12 @@ class MainViewController: NSViewController {
     // Version info
     var versionInfoObject = VersionInfoObject()
     private var numberOfUpdates: Int = 0
-    
+
     // View did load
     override func viewDidLoad() {
         super.viewDidLoad()
         MainViewController.instance = self
-        
+
         // Set delegates
         vmsTableView.delegate = self
         vmsTableView.dataSource = self
@@ -71,7 +75,7 @@ class MainViewController: NSViewController {
         vmDescriptionTextView.delegate = self
         // Register table view for drag and drop
         vmsTableView.registerForDraggedTypes([dragDropType])
-        
+
         // Config views
         configView()
         // Set MacBox home directory
@@ -86,7 +90,7 @@ class MainViewController: NSViewController {
         checkFor86Box()
         checkForRoms()
     }
-    
+
     // View will appear
     override func viewWillAppear() {
         // Set the Start VM button dynamic width based on localized title
@@ -96,7 +100,7 @@ class MainViewController: NSViewController {
         // Set the app's appearance
         setAppearance()
     }
-    
+
     // Set the app's appearance
     private func setAppearance() {
         if let appAppearance = userDefaults.string(forKey: "appAppearance") {
@@ -110,16 +114,16 @@ class MainViewController: NSViewController {
             }
         }
     }
-    
+
     // Set screensaver & screen sleep preference
     private func setScreenSaver() {
         let disableScreensaver = userDefaults.bool(forKey: "disableScreensaver")
-        
+
         if disableScreensaver == true {
             screensaverManager.disableScreensaver()
         }
     }
-    
+
     // Set 86Box default path
     private func setEmulatorDefaultPath() {
         if let defaultPath = userDefaults.string(forKey: "emulatorDefaultPath") {
@@ -133,14 +137,14 @@ class MainViewController: NSViewController {
             }
         }
     }
-    
+
     // Set 86Box update channel
     private func setEmulatorUpdateChannel() {
         if let updateChannel = userDefaults.string(forKey: "emulatorUpdateChannel") {
             versionInfoObject.emulatorUpdateChannel = updateChannel
         }
     }
-    
+
     // Config views initial properties
     private func configView() {
         spinningProgressIndicator.startAnimation(self)
@@ -156,7 +160,7 @@ class MainViewController: NSViewController {
         let menu = NSMenu()
         menu.delegate = self
         vmsTableView.menu = menu
-        
+
         // Add double click for table view cells
         vmsTableView.doubleAction = #selector(tableViewDoubleClickAction(_:))
     }
@@ -177,17 +181,25 @@ class MainViewController: NSViewController {
         vmSpecHDD.stringValue = "-"
         vmSpecMachineLogo.image = nil
     }
-    
+
     // Set MacBox home directory path
     private func setHomeDir() {
+        #if DEBUG
+        // Development builds must always use isolated storage.
+        homeDirURL = URL(
+            fileURLWithPath: "MacBox-Dev",
+            isDirectory: true,
+            relativeTo: fileManager.homeDirectoryForCurrentUser
+        )
+        #else
         if let homeDirPath = userDefaults.string(forKey: "homeDirPath") {
             if #available(macOS 13.0, *) {
                 homeDirURL = URL(filePath: homeDirPath)
             } else {
-                // Fallback on earlier versions
                 homeDirURL = URL(fileURLWithPath: homeDirPath)
             }
         }
+        #endif
     }
 
     // Initialize MacBox directory and config files
@@ -198,11 +210,11 @@ class MainViewController: NSViewController {
         } catch {
             print("Error: \(error.localizedDescription)")
         }
-        
+
         // Initialize the config file
         initConfigFile()
     }
-    
+
     // Initialize MacBox config file
     private func initConfigFile() {
         var configFileURL = homeDirURL
@@ -218,7 +230,7 @@ class MainViewController: NSViewController {
         else {
             readConfigFile()
         }
-        
+
         // Restore last selected vm
         let lastSelectedVM = userDefaults.integer(forKey: "lastSelectedVM")
         if lastSelectedVM >= 0 && lastSelectedVM < vmList.count {
@@ -228,12 +240,12 @@ class MainViewController: NSViewController {
             selectTableRow(row: lastSelectedVM)
         }
     }
-    
+
     // Write the MacBox config file
     private func writeConfigFile() {
         var configStr = ""
         let jsonEncoder = JSONEncoder()
-        
+
         // Encode VM list as JSON data
         do{
             let jsonResultData = try jsonEncoder.encode(vmList)
@@ -241,7 +253,7 @@ class MainViewController: NSViewController {
         } catch {
             print("Error: \(error.localizedDescription)")
         }
-        
+
         // Write data to the Config file
         if #available(macOS 13.0, *) {
             let configFileURL = homeDirURL.appending(component: "Config")
@@ -260,7 +272,7 @@ class MainViewController: NSViewController {
             }
         }
     }
-    
+
     // Read from the MacBox config file
     private func readConfigFile() {
         var configFileURL: URL?
@@ -270,13 +282,13 @@ class MainViewController: NSViewController {
             // Fallback on earlier versions
             configFileURL = homeDirURL.appendingPathComponent("Config")
         }
-        
+
         // Decode JSON data and add it to the vmList
         do {
             let jsonData = try Data(contentsOf: configFileURL ?? URL(fileURLWithPath: ""))
             let jsonDecoder = JSONDecoder()
             let vms = try jsonDecoder.decode([VM].self, from: jsonData)
-            
+
             for vm in vms {
                 addVM(vm: vm)
             }
@@ -284,7 +296,7 @@ class MainViewController: NSViewController {
             print("Error: \(error.localizedDescription)")
         }
     }
-    
+
     // Update the config file for custom HomeDir path
     func updateConfigFile(previousLocation: URL, newLocation: URL) {
         for vm in vmList {
@@ -303,37 +315,39 @@ class MainViewController: NSViewController {
         // Recheck for MacBox in-case it was moved with the home directory
         checkFor86Box(url: nil, appVer: nil, buildVer: nil, ignoreVersionCheck: true)
     }
-    
+
     // Check if 86Box is installed, and check for updated version
     func checkFor86Box(url: URL? = nil, appVer: String? = nil, buildVer: String? = nil, ignoreVersionCheck: Bool = false) {
         var localUrl: URL?
-        
+
         if let url = url {
             // Updated 86Box app url
             localUrl = url
             versionInfoObject.emulatorAutoUrl = url
-            
+
             if let appVer = appVer {
                 emulatorAppVer = appVer
             }
-            
+
             if let buildVer = buildVer {
                 emulatorBuildVer = buildVer
             }
         }
         else {
-            // Check if 86Box app is installed
+            // Only discover globally registered 86Box in Release builds.
+            // Development builds must not select the production emulator.
+            #if !DEBUG
             if let bundleURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "net.86Box.86Box") {
-                // Save 86Box emulator URL
                 versionInfoObject.emulatorAutoUrl = bundleURL
                 localUrl = bundleURL
             }
-            
+            #endif
+
             // Check if there's a custom 86Box path set
             if versionInfoObject.emulatorCustomUrl != nil {
                 localUrl = versionInfoObject.emulatorCustomUrl
             }
-            
+
             if let localUrl = localUrl, !ignoreVersionCheck {
                 // Get 86Box info.plist
                 if let bundle = Bundle(url: localUrl) {
@@ -348,12 +362,17 @@ class MainViewController: NSViewController {
                 }
             }
         }
-        
+
         fetchLatestOnlineBuildNumbers()
     }
-    
+
     // Check all possible locations for 86Box ROMs
     func checkForRoms() {
+        #if DEBUG
+        NSLog("MacBoxDev: global ROM discovery disabled.")
+        return
+        #endif
+
         // Check location related to VMs
         for vm in vmList {
             if let vmPath = vm.path {
@@ -369,7 +388,7 @@ class MainViewController: NSViewController {
                 }
             }
         }
-        
+
         // Check location related to 86Box
         if let emulatorAutoPath = versionInfoObject.emulatorAutoUrl?.relativePath {
             let romsDirPath = emulatorAutoPath + "/roms"
@@ -383,7 +402,7 @@ class MainViewController: NSViewController {
                 }
             }
         }
-        
+
         if let emulatorCustomPath = versionInfoObject.emulatorCustomUrl?.relativePath {
             let romsDirPath = emulatorCustomPath + "/roms"
             var isDirectory : ObjCBool = false
@@ -396,7 +415,7 @@ class MainViewController: NSViewController {
                 }
             }
         }
-        
+
         // Check location related to system library
         let appSupportDir = fileManager.urls(for: .applicationSupportDirectory, in: [.userDomainMask, .systemDomainMask])
         for dir in appSupportDir {
@@ -412,20 +431,20 @@ class MainViewController: NSViewController {
             }
         }
     }
-    
+
     // Fetch the latest 86Box build version, ROMs and MacBox version
     private func fetchLatestOnlineBuildNumbers() {
         numberOfUpdates = 0
-        
+
         // Check for internet connection
         let monitor = NWPathMonitor()
         let queue = DispatchQueue(label: "InternetConnectionMonitor")
-        
+
         monitor.pathUpdateHandler = { pathUpdateHandler in
             if pathUpdateHandler.status == .satisfied {
                 // Cancel the NWPathMonitor as it's not needed any longer
                 monitor.cancel()
-                
+
                 // We're online, fetch 86Box build version from update channel
                 if self.versionInfoObject.emulatorUpdateChannel == "stable" {
                     // Stable: from GitHub
@@ -442,24 +461,24 @@ class MainViewController: NSViewController {
                 self.updateVersionStatus()
             }
         }
-        
+
         monitor.start(queue: queue)
     }
-    
+
     // Fetch 86Box update info from Jenkins
     private func fetchEmulatorUpdateInfoFromJenkins() {
         if let url = URL(string: "https://ci.86box.net/job/86Box/lastStableBuild/api/json") {
             var request = URLRequest(url: url)
             request.httpMethod = "GET"
-            
+
             let task = URLSession.shared.dataTask(with: url) {(data, response, error) in
                 guard let data = data else { return }
-                
+
                 do {
                     // Try getting the 86Box update info from Jenkins
                     let jenkinsJsonResponse = try JSONDecoder().decode(JenkinsResponseObject.self, from: data)
                     self.versionInfoObject.emulatorUpdateObject = jenkinsJsonResponse.toGithubResponseObject()
-                    
+
                     // Set status label
                     if let jenkinsBuildVer = jenkinsJsonResponse.number {
                         self.emulatorOnlineVer = String(jenkinsBuildVer)
@@ -471,7 +490,7 @@ class MainViewController: NSViewController {
                     else {
                         self.emulatorOnlineVer = "0"
                     }
-                    
+
                     // Check for latest 86Box ROMs
                     self.fetchEmulatorRomsUpdateInfo()
                 } catch {
@@ -486,7 +505,7 @@ class MainViewController: NSViewController {
             task.resume()
         }
     }
-    
+
     // Fetch 86Box update info from GitHub
     private func fetchEmulatorUpdateInfoFromGitHub() {
         if let url = URL(string: "https://api.github.com/repos/86Box/86Box/releases/latest") {
@@ -494,15 +513,15 @@ class MainViewController: NSViewController {
             request.httpMethod = "GET"
             request.setValue(httpHeaderAcceptValue, forHTTPHeaderField: "Accept")
             request.setValue(httpHeaderContentTypeValue, forHTTPHeaderField: "Content-Type")
-            
+
             let task = URLSession.shared.dataTask(with: request) {(data, response, error) in
                 guard let data = data else { return }
-                
+
                 do {
                     // Try getting the MacBox repo info from GitHub
                     let githubJsonResponse = try JSONDecoder().decode(GithubResponseObject.self, from: data)
                     self.versionInfoObject.emulatorUpdateObject = githubJsonResponse
-                    
+
                     if let githubBuildVer = githubJsonResponse.tag_name {
                         if githubBuildVer.hasPrefix("v") {
                             self.emulatorOnlineVer = String(githubBuildVer.dropFirst())
@@ -518,7 +537,7 @@ class MainViewController: NSViewController {
                     else {
                         self.emulatorOnlineVer = "0"
                     }
-                    
+
                     // Check for latest 86Box ROMs
                     self.fetchEmulatorRomsUpdateInfo()
                 } catch {
@@ -529,7 +548,7 @@ class MainViewController: NSViewController {
             task.resume()
         }
     }
-    
+
     // Fetch 86Box ROMs update info from GitHub
     private func fetchEmulatorRomsUpdateInfo() {
         if let url = URL(string: "https://api.github.com/repos/86Box/roms/commits/master") {
@@ -537,15 +556,15 @@ class MainViewController: NSViewController {
             request.httpMethod = "GET"
             request.setValue(httpHeaderAcceptValue, forHTTPHeaderField: "Accept")
             request.setValue(httpHeaderContentTypeValue, forHTTPHeaderField: "Content-Type")
-            
+
             let task = URLSession.shared.dataTask(with: request) {(data, response, error) in
                 guard let data = data else { return }
-                
+
                 do {
                     // Try getting the 86Box ROMs repo info from GitHub
                     let githubJsonResponse = try JSONDecoder().decode(GithubResponseObject.self, from: data)
                     self.versionInfoObject.romsUpdateObject = githubJsonResponse
-                    
+
                     // Compare versions
                     if let latestShaVersion = githubJsonResponse.sha {
                         if let localShaVersion = self.userDefaults.string(forKey: "romsShaVersion") {
@@ -559,7 +578,7 @@ class MainViewController: NSViewController {
                             self.numberOfUpdates += 1
                         }
                     }
-                    
+
                     // Check for latest MacBox github version
                     self.fetchMacBoxUpdateInfo()
                 } catch {
@@ -569,7 +588,7 @@ class MainViewController: NSViewController {
             task.resume()
         }
     }
-    
+
     // Fetch MacBox update info from GitHub
     private func fetchMacBoxUpdateInfo() {
         if let url = URL(string: "https://api.github.com/repos/Moonif/MacBox/releases/latest") {
@@ -577,25 +596,25 @@ class MainViewController: NSViewController {
             request.httpMethod = "GET"
             request.setValue(httpHeaderAcceptValue, forHTTPHeaderField: "Accept")
             request.setValue(httpHeaderContentTypeValue, forHTTPHeaderField: "Content-Type")
-            
+
             let task = URLSession.shared.dataTask(with: request) {(data, response, error) in
                 guard let data = data else { return }
-                
+
                 do {
                     // Try getting the MacBox repo info from GitHub
                     let githubJsonResponse = try JSONDecoder().decode(GithubResponseObject.self, from: data)
                     self.versionInfoObject.macboxUpdateObject = githubJsonResponse
-                    
+
                     // Compare versions
                     if let latestTagVersion = githubJsonResponse.tag_name {
                         let localBuildVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? String(latestTagVersion)
-                        
+
                         if localBuildVersion != String(latestTagVersion) {
                             // New version found
                             self.numberOfUpdates += 1
                         }
                     }
-                    
+
                     // Update the version status
                     self.updateVersionStatus()
                 } catch {
@@ -605,7 +624,7 @@ class MainViewController: NSViewController {
             task.resume()
         }
     }
-    
+
     // Update the version status
     private func updateVersionStatus () {
         DispatchQueue.main.async {
@@ -613,19 +632,19 @@ class MainViewController: NSViewController {
             self.statusCheckMarkImage.isHidden = true
             self.statusXMarkImage.isHidden = true
             self.statusExclamationMarkImage.isHidden = true
-            
+
             // Enable version manager when online
             if self.emulatorOnlineVer != "0" {
                 self.statusArrowImage.isHidden = false
                 self.statusButton.isEnabled = true
             }
-            
+
             // Check for local build
             if self.emulatorBuildVer == ".0.0" {
                 self.statusLabel.stringValue = String(format: NSLocalizedString("86Box v%@ (Local Build)", comment: ""), self.emulatorAppVer)
                 return
             }
-            
+
             // Set version status
             let updateString = self.numberOfUpdates == 1 ? NSLocalizedString("update", comment: "") : NSLocalizedString("updates", comment: "")
             if self.emulatorBuildVer != "0" {
@@ -649,7 +668,7 @@ class MainViewController: NSViewController {
                 self.statusLabel.stringValue = NSLocalizedString("86Box is not installed.", comment: "")
                 self.statusXMarkImage.isHidden = false
             }
-            
+
             // Set status color to red when 86Box is not installed
             if self.versionInfoObject.emulatorAutoUrl == nil && self.versionInfoObject.emulatorCustomUrl == nil {
                 self.statusLabel.textColor = .systemRed
@@ -659,12 +678,17 @@ class MainViewController: NSViewController {
             }
         }
     }
-    
+
     // Add VM to the table view
     func addVM(vm: VM, vmTemplate: VMTemplate? = nil) {
+        #if DEBUG
+        NSLog("MacBoxDev: VM creation and import disabled during isolation testing.")
+        return
+        #endif
+
         // Make sure vm has a path
         var fixedVM = vm
-        
+
         if vm.path == nil {
             var defaultPath = homeDirURL
             if #available(macOS 13.0, *) {
@@ -673,22 +697,22 @@ class MainViewController: NSViewController {
                 // Fallback on earlier versions
                 defaultPath = homeDirURL.appendingPathComponent("\(vm.name?.replacingOccurrences(of: "/", with: "")  ?? "")")
             }
-            
+
             // Check if path was used before
             if fileManager.fileExists(atPath: defaultPath.path) {
                 defaultPath = homeDirURL.appendingPathComponent(UUID().uuidString)
             }
-            
+
             fixedVM.path = defaultPath.path
         }
-        
+
         // Create all VM paths
         setAllVMPaths(vmPath: fixedVM.path ?? "")
-        
+
         // Copy template config file
         if vmTemplate != nil, let templateConfigPath = vmTemplate?.configPath {
             let ini = IniParser()
-            
+
             // Copy config file
             let vmConfigPath = fixedVM.path?.appending("/86box.cfg") ?? ""
             do{
@@ -696,7 +720,7 @@ class MainViewController: NSViewController {
             } catch {
                 print("Error: \(error.localizedDescription)")
             }
-            
+
             // Copy shader file
             if vmTemplate?.useShader == true {
                 // Get VM template shader path
@@ -732,7 +756,7 @@ class MainViewController: NSViewController {
                                 } catch {
                                     print("Error: \(error.localizedDescription)")
                                 }
-                                
+
                                 // Write VM config file
                                 if shaderConfigString != "" {
                                     do {
@@ -746,7 +770,7 @@ class MainViewController: NSViewController {
                     }
                 }
             }
-            
+
             // Create disk if available
             let hddParams = ini.parseConfig(templateConfigPath)["Hard disks"]?["hdd_01_parameters"] ?? ""
             let hddParamsSplit = hddParams.split(separator: ",")
@@ -765,11 +789,11 @@ class MainViewController: NSViewController {
                 fileManager.createFile(atPath: fixedVM.path?.appending("/disks/hdd.IMG") ?? "", contents: rawData, attributes: nil)
             }
         }
-        
+
         vmList.append(fixedVM)
         vmsTableView.reloadData()
         writeConfigFile()
-        
+
         // Select last added VM
         let lastIndex = vmList.count - 1
         let indexSet = IndexSet(integer: lastIndex)
@@ -777,26 +801,26 @@ class MainViewController: NSViewController {
         vmsTableView.scrollRowToVisible(lastIndex)
         selectTableRow(row: lastIndex)
     }
-    
+
     // Delete selected VM
     func deleteVM() {
         if currentSelectedVM != nil {
             // Show confirmation alert
             let alert = NSAlert()
-            
+
             alert.messageText = NSLocalizedString("Do you want to remove the selected VM?", comment: "")
             alert.informativeText = NSLocalizedString("This will only remove it from MacBox. If you also want to remove the VM files, check the option below.", comment: "")
             alert.alertStyle = .critical
             alert.addButton(withTitle: NSLocalizedString("Remove", comment: "")).bezelColor = .controlAccentColor
             alert.addButton(withTitle: NSLocalizedString("Cancel", comment: ""))
-            
+
             // Add delete option accessory view
             let deleteOptionButton = NSButton(checkboxWithTitle: NSLocalizedString("Send the selected VM and all its files to trash", comment: ""), target: nil, action: nil)
             alert.accessoryView = deleteOptionButton
-            
+
             // Show the alert
             let alertResult = alert.runModal()
-            
+
             // User pressed the Remove button
             if alertResult == .alertFirstButtonReturn {
                 // Send vm files to trash
@@ -825,7 +849,7 @@ class MainViewController: NSViewController {
                         }
                     }
                 }
-                
+
                 // Remove vm from list
                 vmList.remove(at: currentSelectedVM!)
                 vmsTableView.reloadData()
@@ -833,35 +857,35 @@ class MainViewController: NSViewController {
             }
         }
     }
-    
+
     // Copy the selected VM
     private func copyVM(row: Int) {
         let vmPathURL = URL(fileURLWithPath: vmList[row].path ?? "")
-        
+
         // VM copy path
         var vmCopyPathURL = URL(string: "")
         let copyString: String = "(Copy)"
-        
+
         if #available(macOS 13.0, *) {
             vmCopyPathURL = homeDirURL.appending(component: vmPathURL.lastPathComponent + copyString)
         } else {
             // Fallback on earlier versions
             vmCopyPathURL = homeDirURL.appendingPathComponent(vmPathURL.lastPathComponent + copyString)
         }
-        
+
         if vmCopyPathURL != nil {
             // Check if path was used before
             if fileManager.fileExists(atPath: vmCopyPathURL?.path ?? "") {
                 vmCopyPathURL = homeDirURL.appendingPathComponent(UUID().uuidString)
             }
-            
+
             // Copy the VM folder
             do{
                 try fileManager.copyItem(atPath: vmPathURL.path, toPath: vmCopyPathURL?.path ?? "")
-                
+
                 // Create the VM copy
                 var vm = VM()
-                
+
                 // Set VM properties
                 vm.name = (vmList[row].name ?? "") + copyString
                 vm.description = vmList[row].description
@@ -875,12 +899,17 @@ class MainViewController: NSViewController {
             }
         }
     }
-    
+
     // Start VM process
     private func startVM(launchSettings: Bool = false) {
+        #if DEBUG
+        NSLog("MacBoxDev: VM launching disabled during isolation testing.")
+        return
+        #endif
+
         if currentSelectedVM != nil {
             let process = Process()
-            
+
             let vmName = (vmList[currentSelectedVM ?? 0]).name ?? "86Box - MacBoxVM"
             // Set default path for new VMs
             var defaultPath = homeDirURL
@@ -891,11 +920,11 @@ class MainViewController: NSViewController {
                 defaultPath = homeDirURL.appendingPathComponent("/\(vmName)")
             }
             let vmPath = (vmList[currentSelectedVM ?? 0]).path ?? defaultPath.path
-            
+
             // Selected app version
             var vmAppVersion = "net.86Box.86Box"
             var vmAppArg = "-b"
-            
+
             // Set the emulator path if we already have it
             if let emulatorCustomPath = versionInfoObject.emulatorCustomUrl?.path {
                 vmAppVersion = emulatorCustomPath
@@ -905,7 +934,7 @@ class MainViewController: NSViewController {
                 vmAppVersion = emulatorAutoPath
                 vmAppArg = "-a"
             }
-            
+
             if let customAppPath = vmList[currentSelectedVM ?? 0].appPath {
                 if fileManager.fileExists(atPath: customAppPath) {
                     vmAppVersion = customAppPath
@@ -914,17 +943,17 @@ class MainViewController: NSViewController {
                 else {
                     // Custom app version was not found (Probably got moved or deleted)
                     let alert = NSAlert()
-                    
+
                     alert.messageText = NSLocalizedString("Selected 86Box file is not found. VM will open using default version.", comment: "")
                     alert.alertStyle = .critical
-                    
+
                     alert.runModal()
                 }
             }
-            
+
             // Check fullscreen option
             let vmFullScreen = vmList[currentSelectedVM ?? 0].fullScreen ?? false
-            
+
             // Set process arguments
             let argsString: String = "--args"
             let args:[String] = launchSettings ?
@@ -933,7 +962,7 @@ class MainViewController: NSViewController {
             ["-n", "-W", vmAppArg,vmAppVersion,argsString,"-P","\(vmPath)","-V",vmName, "-F"] :
             ["-n", "-W", vmAppArg,vmAppVersion,argsString,"-P","\(vmPath)","-V",vmName]
             process.arguments = args
-            
+
             process.executableURL = URL(fileURLWithPath:"/usr/bin/open")
 
             // Run the process
@@ -946,21 +975,21 @@ class MainViewController: NSViewController {
                 }
                 let lastSelectedRow = currentSelectedVM
                 vmsTableView.reloadData()
-                
+
                 // Re-select previously selected row
                 reselectTableRow(row: lastSelectedRow)
-                
+
                 // Wait for process to end
                 Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { (timer) in
                     if !process.isRunning {
                         // Process is terminated, invalidate timer
                         timer.invalidate()
-                        
+
                         // Clear current running vm
                         self.currentRunningVM.removeAll(where:{ $0.vmProcessID == process.processIdentifier })
-                        
+
                         self.vmsTableView.reloadData()
-                        
+
                         // Re-select previously selected row
                         self.reselectTableRow(row: lastSelectedRow)
                     }
@@ -970,7 +999,7 @@ class MainViewController: NSViewController {
             }
         }
     }
-    
+
     // Select table row and populate vm info
     private func selectTableRow(row: Int) {
         currentSelectedVM = row
@@ -978,7 +1007,7 @@ class MainViewController: NSViewController {
         vmAppVersionPopUpButton.isEnabled = true
         vmSettingsButton.isEnabled = true
         deleteVMButton.isEnabled = true
-        
+
         // VM properties
         let vmName = vmList[row].name ?? "86Box - MacBoxVM"
         let vmDescription = vmList[row].description ?? ""
@@ -986,14 +1015,14 @@ class MainViewController: NSViewController {
         currentVMPrinterPath = vmPath.appending("/printer")
         currentVMScreenShotsPath = vmPath.appending("/screenshots")
         currentVMConfigPath = vmPath.appending("/86box.cfg")
-        
+
         // Set VM name and description text
         vmNameTextField.stringValue = vmName
         vmDescriptionTextView.string = vmDescription
-        
+
         // Set VM specs
         setVMSpecs()
-        
+
         // Check for custom app path
         if vmList[row].appPath != nil {
             vmAppVersionPopUpButton.selectItem(at: 1)
@@ -1002,22 +1031,22 @@ class MainViewController: NSViewController {
             vmAppVersionPopUpButton.selectItem(at: 0)
         }
         setPopupOptionsMultiselection()
-        
+
         // Set user defaults
         DispatchQueue.main.async {
             self.userDefaults.set(row, forKey: "lastSelectedVM")
         }
     }
-    
+
     // Re-select previously selected row
     private func reselectTableRow(row: Int?) {
         let indexSet = IndexSet(integer: row ?? 0)
-        
+
         vmsTableView.selectRowIndexes(indexSet, byExtendingSelection: false)
         vmsTableView.scrollRowToVisible(row ?? 0)
         selectTableRow(row: row ?? 0)
     }
-    
+
     // Tableview cell 'Show in Finder' action
     @objc private func tableViewFindInFinderAction(_ sender: AnyObject) {
         if vmsTableView.clickedRow >= 0 {
@@ -1025,28 +1054,28 @@ class MainViewController: NSViewController {
             NSWorkspace.shared.open(vmPathURL)
         }
     }
-    
+
     // Tableview cell 'Duplicate' action
     @objc private func tableViewDuplicateAction(_ sender: AnyObject) {
         if vmsTableView.clickedRow >= 0 {
             copyVM(row: vmsTableView.clickedRow)
         }
     }
-    
+
     // Tableview cell double click action
     @objc private func tableViewDoubleClickAction(_ sender: AnyObject) {
         if vmsTableView.clickedRow >= 0 {
             startVM()
         }
     }
-    
+
     // Set all VM paths
     private func setAllVMPaths(vmPath: String) {
         let printerPath = vmPath.appending("/printer")
         let screenshotsPath = vmPath.appending("/screenshots")
         let diskPath = vmPath.appending("/disks")
         let shaderPath = vmPath.appending("/shaders")
-        
+
         // Create printer folder if it doesn't already exist
         if !fileManager.fileExists(atPath: printerPath) {
             do {
@@ -1055,7 +1084,7 @@ class MainViewController: NSViewController {
                 print("Error: \(error.localizedDescription)")
             }
         }
-        
+
         // Create screenshots folder if it doesn't already exist
         if !fileManager.fileExists(atPath: screenshotsPath) {
             do {
@@ -1064,7 +1093,7 @@ class MainViewController: NSViewController {
                 print("Error: \(error.localizedDescription)")
             }
         }
-        
+
         // Create disk folder if it doesn't already exist
         if !fileManager.fileExists(atPath: diskPath) {
             do {
@@ -1073,7 +1102,7 @@ class MainViewController: NSViewController {
                 print("Error: \(error.localizedDescription)")
             }
         }
-        
+
         // Create shader folder if it doesn't already exist
         if !fileManager.fileExists(atPath: shaderPath) {
             do {
@@ -1083,7 +1112,7 @@ class MainViewController: NSViewController {
             }
         }
     }
-    
+
     // Set current VM specs
     private func setVMSpecs() {
         if currentVMConfigPath != nil {
@@ -1096,7 +1125,7 @@ class MainViewController: NSViewController {
                 vmSpecCPU.stringValue = parsedSpecs.cpu
                 vmSpecRAM.stringValue = parsedSpecs.ram
                 vmSpecHDD.stringValue = parsedSpecs.hdd
-                
+
                 // Define machine logo
                 if let machineLogo = vmList[currentSelectedVM ?? 0].logo {
                     vmSpecMachineLogo.image = NSImage(named: machineLogo)
@@ -1135,7 +1164,7 @@ class MainViewController: NSViewController {
             }
         }
     }
-    
+
     // Set the Start button popup options multiselection
     private func setPopupOptionsMultiselection() {
         if let selectedVM = currentSelectedVM {
@@ -1145,7 +1174,7 @@ class MainViewController: NSViewController {
             else {
                 vmAppVersionPopUpButton.selectItem(at: 1)
             }
-            
+
             if vmList[selectedVM].fullScreen != nil && vmList[selectedVM].fullScreen! {
                 vmAppVersionPopUpButton.itemArray[3].state = .on
             }
@@ -1154,72 +1183,72 @@ class MainViewController: NSViewController {
             }
         }
     }
-    
+
 // ------------------------------------
 // IBActions
 // ------------------------------------
-    
+
     // Start VM button action
     @IBAction func startVMButtonAction(_ sender: NSButton) {
         startVM()
     }
-    
+
     // VM settings button action
     @IBAction func vmSettingsButtonAction(_ sender: NSButton) {
         startVM(launchSettings: true)
     }
-    
+
     // Delete VM button action
     @IBAction func deleteVMButtonAction(_ sender: NSButton) {
         deleteVM()
     }
-    
+
     // Add VM toolbar button action
     @IBAction func addVMButtonAction(_ sender: Any) {
         if let addVMTabViewVC = self.storyboard?.instantiateController(withIdentifier: "AddVMVC") as? NSTabViewController {
             self.presentAsModalWindow(addVMTabViewVC)
         }
-        
+
         // Deselect the toolbar button after action
         if let senderButton = sender as? NSToolbarItem {
             senderButton.toolbar?.selectedItemIdentifier = nil
         }
     }
-    
+
     // Print tray toolbar button action
     @IBAction func printTrayButtonAction(_ sender: Any) {
         if currentVMPrinterPath != nil {
             NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: String(currentVMPrinterPath ?? ""))
         }
-        
+
         // Deselect the toolbar button after action
         if let senderButton = sender as? NSToolbarItem {
             senderButton.toolbar?.selectedItemIdentifier = nil
         }
     }
-    
+
     // Screenshots toolbar button action
     @IBAction func screenshotsButtonAction(_ sender: Any) {
         if currentVMScreenShotsPath != nil {
             NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: String(currentVMScreenShotsPath ?? ""))
         }
-        
+
         // Deselect the toolbar button after action
         if let senderButton = sender as? NSToolbarItem {
             senderButton.toolbar?.selectedItemIdentifier = nil
         }
     }
-    
+
     // Settings button action
     @IBAction func showSettingsWindow(_ sender: Any?) {
         self.performSegue(withIdentifier: "showSettingsVC", sender: sender)
     }
-    
+
     // Open the Jenkins url
     @IBAction func versionStatusButtonAction(_ sender: NSButton) {
         self.performSegue(withIdentifier: "showVersionManagerVC", sender: sender)
     }
-    
+
     // Select 86Box version for the selected vm
     @IBAction func vmAppVersionPopUpButtonAction(_ sender: NSPopUpButton) {
         if sender.selectedItem?.identifier == NSUserInterfaceItemIdentifier(rawValue: "defaultAppId") {
@@ -1233,12 +1262,12 @@ class MainViewController: NSViewController {
         else if sender.selectedItem?.identifier == NSUserInterfaceItemIdentifier(rawValue: "customAppId") {
             // Open the file picker
             let filePickerPanel = NSOpenPanel()
-            
+
             filePickerPanel.allowsMultipleSelection = false
             filePickerPanel.canChooseDirectories = false
             filePickerPanel.canChooseFiles = true
             filePickerPanel.allowedFileTypes = ["app"]
-            
+
             if filePickerPanel.runModal() == .OK {
                 if let appURL = filePickerPanel.url {
                     if let selectedVM = currentSelectedVM {
@@ -1266,11 +1295,11 @@ class MainViewController: NSViewController {
                 writeConfigFile()
             }
         }
-        
+
         // Set popup options multiselection
         setPopupOptionsMultiselection()
     }
-    
+
 // ------------------------------------
 // Segue handling
 // ------------------------------------
@@ -1280,7 +1309,7 @@ class MainViewController: NSViewController {
             if let versionManagerVC = segue.destinationController as? VersionManagerViewController {
                 versionManagerVC.emulatorAppVer = emulatorAppVer
                 versionManagerVC.emulatorBuildVer = emulatorBuildVer
-                
+
                 if versionInfoObject.emulatorUpdateChannel == "stable" {
                     versionManagerVC.isStableChannel = true
                 }
@@ -1293,12 +1322,12 @@ class MainViewController: NSViewController {
 // VM TableView Delegate and Datasource
 // ------------------------------------
 extension MainViewController: NSTableViewDelegate, NSTableViewDataSource {
-    
+
     // Return number of cells for vm table view
     func numberOfRows(in tableView: NSTableView) -> Int {
         return vmList.count
     }
-    
+
     // Populate cells based on vmList data
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         let vmObject = vmList[row]
@@ -1314,25 +1343,25 @@ extension MainViewController: NSTableViewDelegate, NSTableViewDataSource {
         }
         return cell
     }
-    
+
     // Handle cells selection
     func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool {
         selectTableRow(row: row)
-        
+
         return true
     }
-    
+
     // Set drag and drop for table cells
     func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
         let indexSet = IndexSet(integer: row)
         vmsTableView.selectRowIndexes(indexSet, byExtendingSelection: false)
         selectTableRow(row: row)
-        
+
         let item = NSPasteboardItem()
         item.setString(String(row), forType: self.dragDropType)
         return item
     }
-    
+
     // Validate drag and drop behavior
     func tableView(_ tableView: NSTableView, validateDrop info: NSDraggingInfo, proposedRow row: Int, proposedDropOperation dropOperation: NSTableView.DropOperation) -> NSDragOperation {
         if dropOperation == .above {
@@ -1340,7 +1369,7 @@ extension MainViewController: NSTableViewDelegate, NSTableViewDataSource {
         }
         return []
     }
-    
+
     // Handle post drag and drop behavior
     func tableView(_ tableView: NSTableView, acceptDrop info: NSDraggingInfo, row: Int, dropOperation: NSTableView.DropOperation) -> Bool {
         var oldIndexes = [Int]()
@@ -1349,10 +1378,10 @@ extension MainViewController: NSTableViewDelegate, NSTableViewDataSource {
                 oldIndexes.append(index)
             }
         }
-        
+
         var oldIndexOffset = 0
         var newIndexOffset = 0
-        
+
         // Update table view cells and vmlist data
         tableView.beginUpdates()
         for oldIndex in oldIndexes {
@@ -1376,13 +1405,13 @@ extension MainViewController: NSTableViewDelegate, NSTableViewDataSource {
             }
         }
         tableView.endUpdates()
-        
+
         // Update config file
         writeConfigFile()
-        
+
         return true
     }
-    
+
     // Disable events for table view
     func tableView(_ tableView: NSTableView, shouldTypeSelectFor event: NSEvent, withCurrentSearch searchString: String?) -> Bool {
         return false
@@ -1411,7 +1440,7 @@ extension MainViewController: NSTextFieldDelegate {
             }
         }
     }
-    
+
     func controlTextDidEndEditing(_ obj: Notification) {
         if let textField = obj.object as? NSTextField {
             if textField.identifier == NSUserInterfaceItemIdentifier(rawValue: "vmNameID") {
@@ -1454,7 +1483,7 @@ extension MainViewController: NSTextViewDelegate {
 extension MainViewController: NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
-        
+
         if vmsTableView.clickedRow >= 0 {
             // Right-Clicked on a VM cell
             menu.addItem(NSMenuItem(title: NSLocalizedString("Show in Finder", comment: ""), action: #selector(tableViewFindInFinderAction(_:)), keyEquivalent: ""))
