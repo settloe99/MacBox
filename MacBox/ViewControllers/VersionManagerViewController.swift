@@ -439,7 +439,12 @@ class VersionManagerViewController: NSViewController {
         #if DEBUG
                 do {
                     let (appVersion, buildVersion) =
-                        try installDevelopmentEmulator(from: location)
+                        try installVerifiedEmulator(
+                            from: location,
+                            installedAppURL: FileManager.default
+                                .homeDirectoryForCurrentUser
+                                .appendingPathComponent("MacBox-Dev/86Box.app")
+                        )
 
                     let destination = FileManager.default
                         .homeDirectoryForCurrentUser
@@ -571,19 +576,31 @@ class VersionManagerViewController: NSViewController {
         }
     }
 
-    #if DEBUG
-        // Development-only transactional 86Box installer.
-        // Never accepts an installation destination from preferences.
-        private func installDevelopmentEmulator(
-            from downloadedFile: URL
+        // Shared transactional 86Box installer.
+        // The caller supplies the installation directory.
+        private func installVerifiedEmulator(
+            from downloadedFile: URL,
+            installedAppURL: URL
         ) throws -> (String, String) {
-
             let fm = FileManager.default
-            let root = fm.homeDirectoryForCurrentUser
-                .appendingPathComponent("MacBox-Dev", isDirectory: true)
-            let installed = root.appendingPathComponent("86Box.app")
-            let temporary = root.appendingPathComponent("tmp")
-            let backups = root.appendingPathComponent("86Box-backups")
+            let installed = installedAppURL.standardizedFileURL
+            let root = installed.deletingLastPathComponent()
+
+            #if DEBUG
+            // Preserve the development directories we have already tested.
+            let workingRoot = root
+            #else
+            // Keep updater files in the user's Application Support folder.
+            let workingRoot = fm.urls(
+                for: .applicationSupportDirectory,
+                in: .userDomainMask
+            )[0]
+            .appendingPathComponent("MacBox", isDirectory: true)
+            .appendingPathComponent("Updater", isDirectory: true)
+            #endif
+
+            let temporary = workingRoot.appendingPathComponent("tmp")
+            let backups = workingRoot.appendingPathComponent("86Box-backups")
 
             func fail(_ message: String) -> NSError {
                 NSError(
@@ -592,6 +609,25 @@ class VersionManagerViewController: NSViewController {
                     userInfo: [NSLocalizedDescriptionKey: message]
                 )
             }
+
+            // Validate the installation destination.
+            guard installed.isFileURL,
+                installed.lastPathComponent == "86Box.app"
+            else {
+                throw fail("Invalid 86Box installation destination.")
+            }
+
+            #if DEBUG
+            let expected = fm.homeDirectoryForCurrentUser
+                .appendingPathComponent("MacBox-Dev/86Box.app")
+                .standardizedFileURL
+
+            guard installed.path == expected.path else {
+                throw fail(
+                    "Development updates cannot modify production installations."
+                )
+            }
+            #endif
 
             func requireRealDirectory(_ url: URL) throws {
                 let path = url.standardizedFileURL
@@ -659,6 +695,15 @@ class VersionManagerViewController: NSViewController {
             // Never trust an application preference for this destination.
             try requireRealDirectory(root)
             try requireRealDirectory(installed)
+
+            #if !DEBUG
+            try fm.createDirectory(
+                at: workingRoot,
+                withIntermediateDirectories: true
+            )
+            try requireRealDirectory(workingRoot)
+            #endif
+
             try prepareDirectory(temporary)
             try prepareDirectory(backups)
 
@@ -714,38 +759,105 @@ class VersionManagerViewController: NSViewController {
                 throw fail("Downloaded build does not match the expected newer experimental build.")
             }
 
-            // Retain the old application in a separate backup directory.
+            // Prepare unique paths for this installation transaction.
+            let transactionID = UUID().uuidString
+
             let backup = backups.appendingPathComponent(
-                "86Box-\(previous.1)-\(UUID().uuidString).app"
+                "86Box-\(previous.1)-\(transactionID).app"
             )
 
-            try fm.moveItem(at: installed, to: backup)
+            let incoming = root.appendingPathComponent(
+                ".MacBox-86Box-incoming-\(transactionID).app"
+            )
 
+            let parked = root.appendingPathComponent(
+                ".MacBox-86Box-previous-\(transactionID).app"
+            )
+
+            guard !fm.fileExists(atPath: incoming.path),
+                  !fm.fileExists(atPath: parked.path),
+                  !fm.fileExists(atPath: backup.path) else {
+                throw fail("Installation transaction paths already exist.")
+            }
+
+            // Stage the replacement beside the installed application.
+            // A failure here leaves the existing emulator untouched.
+            try fm.copyItem(at: candidate, to: incoming)
+
+            defer {
+                if fm.fileExists(atPath: incoming.path) {
+                    try? fm.removeItem(at: incoming)
+                }
+            }
+
+            let staged = try verify(incoming)
+
+            guard staged.0 == replacement.0,
+                  staged.1 == replacement.1 else {
+                throw fail("Staged application verification failed.")
+            }
+
+            // Preserve and verify an independent recovery copy
+            // before modifying the installed application.
             do {
-                try fm.moveItem(at: candidate, to: installed)
-                let checked = try verify(installed)
+                try fm.copyItem(at: installed, to: backup)
 
-                guard checked.1 == replacement.1 else {
-                    throw fail("Installed build failed verification.")
+                let saved = try verify(backup)
+                guard saved.0 == previous.0,
+                      saved.1 == previous.1 else {
+                    throw fail("Backup version verification failed.")
                 }
             } catch {
+                throw fail(
+                    "Unable to create a verified backup: " +
+                    error.localizedDescription
+                )
+            }
+
+            // Move the original aside on its own filesystem.
+            try fm.moveItem(at: installed, to: parked)
+
+            do {
+                // Install the staged replacement using a local move.
+                try fm.moveItem(at: incoming, to: installed)
+                let checked = try verify(installed)
+
+                guard checked.0 == replacement.0,
+                      checked.1 == replacement.1 else {
+                    throw fail("Installed version verification failed.")
+                }
+
+            } catch {
                 let installationError = error
-                var restorationError: Error?
 
                 do {
                     if fm.fileExists(atPath: installed.path) {
                         try fm.removeItem(at: installed)
                     }
-                    try fm.moveItem(at: backup, to: installed)
-                } catch {
-                    restorationError = error
-                }
 
-                if let restorationError = restorationError {
+                    try fm.moveItem(at: parked, to: installed)
+
+                    let restored = try verify(installed)
+                    guard restored.0 == previous.0,
+                          restored.1 == previous.1 else {
+                        throw fail("Rollback version verification failed.")
+                    }
+
+                } catch {
                     throw fail("""
-                    Installation failed and rollback also failed.
-                    Backup retained at: \(backup.path)
-                    Rollback error: \(restorationError.localizedDescription)
+                    Installation failed and automatic rollback failed.
+
+                    Installation error:
+                    \(installationError.localizedDescription)
+
+                    Rollback error:
+                    \(error.localizedDescription)
+
+                    Verified backup:
+                    \(backup.path)
+
+                    Previous installation location:
+                    \(parked.path)
                     """)
                 }
 
@@ -755,15 +867,26 @@ class VersionManagerViewController: NSViewController {
                 )
             }
 
+            // The replacement is verified and the independent backup
+            // is retained, so the parked copy is no longer needed.
+            do {
+                try fm.removeItem(at: parked)
+            } catch {
+                NSLog(
+                    "MacBox: Could not remove parked application: %@",
+                    error.localizedDescription
+                )
+            }
+
             NSLog(
-                "MacBoxDev: Installed build %@; previous build retained at %@",
+                "MacBox: Installed build %@; backup retained at %@",
                 replacement.1,
                 backup.path
             )
 
             return replacement
+
         }
-    #endif
 
     // Fetch 86Box ROMs file
     private func fetchRomsUpdateFile() {
