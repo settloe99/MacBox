@@ -104,30 +104,101 @@ class VersionManagerViewController: NSViewController {
     }
 
     // Prevent updater operations during initial development testing
-    private func updaterPermitted() -> Bool {
+    private func updaterPermitted(_ type: updateType) -> Bool {
         #if DEBUG
-        NSLog("MacBoxDev: updater disabled in Debug builds.")
-        return false
+        // ROM and MacBox self-updates remain disabled.
+        switch type {
+        case .roms, .macbox:
+            return false
+        case .emulator:
+            break
+        }
+
+        let fm = FileManager.default
+
+        let root = fm.homeDirectoryForCurrentUser
+            .appendingPathComponent(
+                "MacBox-Dev",
+                isDirectory: true
+            ).standardizedFileURL
+
+        let expected = root
+            .appendingPathComponent(
+                "86Box.app",
+                isDirectory: true
+            ).standardizedFileURL
+
+        // Check the configured preference directly.
+        guard let configuredPath = UserDefaults.standard
+            .string(forKey: "emulatorDefaultPath"),
+            configuredPath.hasPrefix("/") else {
+            NSLog("MacBoxDev: No valid emulator path configured.")
+            return false
+        }
+
+        let configured = URL(
+            fileURLWithPath: configuredPath,
+            isDirectory: true
+        ).standardizedFileURL
+
+        guard configured.path == expected.path else {
+            NSLog(
+                "MacBoxDev: Unexpected emulator path: %@",
+                configured.path
+            )
+            return false
+        }
+
+        // Reject missing directories and symbolic-link redirection.
+        for directory in [root, expected] {
+            var isDirectory: ObjCBool = false
+
+            guard fm.fileExists(
+                atPath: directory.path,
+                isDirectory: &isDirectory
+            ),
+            isDirectory.boolValue,
+            directory.path ==
+                directory.resolvingSymlinksInPath()
+                    .standardizedFileURL.path else {
+                NSLog(
+                    "MacBoxDev: Unsafe directory: %@",
+                    directory.path
+                )
+                return false
+            }
+        }
+
+        // Make sure we're targeting an actual 86Box bundle.
+        guard let bundle = Bundle(url: expected),
+            bundle.bundleIdentifier == "net.86Box.86Box" else {
+            NSLog("MacBoxDev: Invalid 86Box bundle.")
+            return false
+        }
+
+        NSLog("MacBoxDev: Development emulator update permitted.")
+        return true
+
         #else
         return true
         #endif
     }
 
-    // Config views initial properties
-    private func configView() {
-        // Populate update info
-        populateEmulatorUpdateInfo()
-        populateRomsUpdateInfo()
-        populateMacBoxUpdateInfo()
-        // Set update buttons visibility
-        setUpdateButtons()
+        // Config views initial properties
+        private func configView() {
+            // Populate update info
+            populateEmulatorUpdateInfo()
+            populateRomsUpdateInfo()
+            populateMacBoxUpdateInfo()
+            // Set update buttons visibility
+            setUpdateButtons()
 
-        #if DEBUG
-        emulatorUpdateButton.isEnabled = false
-        romsUpdateButton.isEnabled = false
-        macboxUpdateButton.isEnabled = false
-        #endif
-    }
+            #if DEBUG
+            emulatorUpdateButton.isEnabled = updaterPermitted(.emulator)
+            romsUpdateButton.isEnabled = false
+            macboxUpdateButton.isEnabled = false
+            #endif
+        }
 
     // Populate 86Box update info
     private func populateEmulatorUpdateInfo() {
@@ -366,8 +437,35 @@ class VersionManagerViewController: NSViewController {
     // Update 86Box binary with the new version
     private func updateEmulatorBinary(location: URL) {
         #if DEBUG
-        NSLog("MacBoxDev: emulator installation blocked.")
-        return
+                do {
+                    let (appVersion, buildVersion) =
+                        try installDevelopmentEmulator(from: location)
+
+                    let destination = FileManager.default
+                        .homeDirectoryForCurrentUser
+                        .appendingPathComponent("MacBox-Dev/86Box.app")
+
+                    MainViewController.instance.checkFor86Box(
+                        url: destination,
+                        appVer: appVersion,
+                        buildVer: buildVersion
+                    )
+
+                    emulatorUpdateProgressIndicator.isHidden = true
+                    emulatorUpdateButton.isHidden = true
+                    emulatorUpdateCheckImageView.isHidden = false
+
+                } catch {
+                    emulatorUpdateProgressIndicator.isHidden = true
+                    emulatorUpdateButton.isHidden = false
+
+                    let alert = NSAlert()
+                    alert.alertStyle = .warning
+                    alert.messageText = "86Box installation failed"
+                    alert.informativeText = error.localizedDescription
+                    alert.runModal()
+                }
+                return
         #endif
 
         let versionInfoObject = MainViewController.instance.versionInfoObject
@@ -472,6 +570,200 @@ class VersionManagerViewController: NSViewController {
             emulatorUpdateButton.isHidden = false
         }
     }
+
+    #if DEBUG
+        // Development-only transactional 86Box installer.
+        // Never accepts an installation destination from preferences.
+        private func installDevelopmentEmulator(
+            from downloadedFile: URL
+        ) throws -> (String, String) {
+
+            let fm = FileManager.default
+            let root = fm.homeDirectoryForCurrentUser
+                .appendingPathComponent("MacBox-Dev", isDirectory: true)
+            let installed = root.appendingPathComponent("86Box.app")
+            let temporary = root.appendingPathComponent("tmp")
+            let backups = root.appendingPathComponent("86Box-backups")
+
+            func fail(_ message: String) -> NSError {
+                NSError(
+                    domain: "MacBoxDev.Updater",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: message]
+                )
+            }
+
+            func requireRealDirectory(_ url: URL) throws {
+                let path = url.standardizedFileURL
+                guard path.path == path.resolvingSymlinksInPath().path,
+                    let attributes = try? fm.attributesOfItem(atPath: path.path),
+                    attributes[.type] as? FileAttributeType == .typeDirectory
+                else {
+                    throw fail("Unsafe directory: \(url.path)")
+                }
+            }
+
+            func prepareDirectory(_ url: URL) throws {
+                if !fm.fileExists(atPath: url.path) {
+                    try fm.createDirectory(
+                        at: url,
+                        withIntermediateDirectories: false
+                    )
+                }
+                try requireRealDirectory(url)
+            }
+
+            // Validate metadata, Apple Silicon compatibility and signature.
+            func verify(_ app: URL) throws -> (String, String) {
+                try requireRealDirectory(app)
+
+                let plistURL = app.appendingPathComponent(
+                    "Contents/Info.plist"
+                )
+                let data = try Data(contentsOf: plistURL)
+                guard let info = try PropertyListSerialization.propertyList(
+                    from: data, format: nil
+                ) as? [String: Any],
+                    info["CFBundleIdentifier"] as? String == "net.86Box.86Box",
+                    let version = info["CFBundleShortVersionString"] as? String,
+                    let fullBuild = info["CFBundleVersion"] as? String,
+                    let build = fullBuild.split(separator: ".").last
+                else {
+                    throw fail("Invalid 86Box application metadata.")
+                }
+
+                let executable = app.appendingPathComponent(
+                    "Contents/MacOS/86Box"
+                )
+
+                for (tool, arguments) in [
+                    ("/usr/bin/codesign", ["--verify", app.path]),
+                    ("/usr/bin/lipo", [
+                        "-verify_arch", "arm64", executable.path
+                    ])
+                ] {
+                    let process = Process()
+                    process.executableURL = URL(fileURLWithPath: tool)
+                    process.arguments = arguments
+                    try process.run()
+                    process.waitUntilExit()
+
+                    guard process.terminationStatus == 0 else {
+                        throw fail("Verification failed: \(tool)")
+                    }
+                }
+
+                return (version, String(build))
+            }
+
+            // Never trust an application preference for this destination.
+            try requireRealDirectory(root)
+            try requireRealDirectory(installed)
+            try prepareDirectory(temporary)
+            try prepareDirectory(backups)
+
+            guard NSRunningApplication.runningApplications(
+                withBundleIdentifier: "net.86Box.86Box"
+            ).isEmpty else {
+                throw fail("Close all running 86Box instances first.")
+            }
+
+            let previous = try verify(installed)
+
+            let stage = temporary.appendingPathComponent(
+                UUID().uuidString, isDirectory: true
+            )
+            try fm.createDirectory(at: stage, withIntermediateDirectories: false)
+
+            defer {
+                try? fm.removeItem(at: stage)
+            }
+
+            let archiveURL = stage.appendingPathComponent("download.zip")
+            try fm.copyItem(at: downloadedFile, to: archiveURL)
+
+            // Reject archive entries outside the expected application.
+            guard let archive = Archive(url: archiveURL, accessMode: .read) else {
+                throw fail("Downloaded file is not a valid ZIP archive.")
+            }
+
+            for entry in archive {
+                let path = entry.path
+                let components = path.split(separator: "/")
+                guard (path == "86Box.app" || path.hasPrefix("86Box.app/")),
+                    !components.contains(".."),
+                    !path.contains("\\")
+                else {
+                    throw fail("Unexpected ZIP archive path: \(path)")
+                }
+            }
+
+            try fm.unzipItem(at: archiveURL, to: stage)
+
+            let candidate = stage.appendingPathComponent("86Box.app")
+            let replacement = try verify(candidate)
+
+            guard !isStableChannel,
+                let expected = MainViewController.instance
+                    .versionInfoObject.emulatorUpdateObject?.tag_name,
+                replacement.1 == expected,
+                let newBuild = Int(replacement.1),
+                let oldBuild = Int(previous.1),
+                newBuild > oldBuild
+            else {
+                throw fail("Downloaded build does not match the expected newer experimental build.")
+            }
+
+            // Retain the old application in a separate backup directory.
+            let backup = backups.appendingPathComponent(
+                "86Box-\(previous.1)-\(UUID().uuidString).app"
+            )
+
+            try fm.moveItem(at: installed, to: backup)
+
+            do {
+                try fm.moveItem(at: candidate, to: installed)
+                let checked = try verify(installed)
+
+                guard checked.1 == replacement.1 else {
+                    throw fail("Installed build failed verification.")
+                }
+            } catch {
+                let installationError = error
+                var restorationError: Error?
+
+                do {
+                    if fm.fileExists(atPath: installed.path) {
+                        try fm.removeItem(at: installed)
+                    }
+                    try fm.moveItem(at: backup, to: installed)
+                } catch {
+                    restorationError = error
+                }
+
+                if let restorationError = restorationError {
+                    throw fail("""
+                    Installation failed and rollback also failed.
+                    Backup retained at: \(backup.path)
+                    Rollback error: \(restorationError.localizedDescription)
+                    """)
+                }
+
+                throw fail(
+                    "Installation failed; the original emulator was restored. " +
+                    installationError.localizedDescription
+                )
+            }
+
+            NSLog(
+                "MacBoxDev: Installed build %@; previous build retained at %@",
+                replacement.1,
+                backup.path
+            )
+
+            return replacement
+        }
+    #endif
 
     // Fetch 86Box ROMs file
     private func fetchRomsUpdateFile() {
@@ -693,7 +985,7 @@ class VersionManagerViewController: NSViewController {
 
     // 86Box update button action
     @IBAction func emulatorUpdateButtonAction(_ sender: NSButton) {
-        guard updaterPermitted() else { return }
+        guard updaterPermitted(.emulator) else { return }
 
         emulatorUpdateButton.isHidden = true
         emulatorUpdateProgressIndicator.isHidden = false
@@ -702,7 +994,7 @@ class VersionManagerViewController: NSViewController {
 
     // 86Box ROMs update button action
     @IBAction func romsUpdateButtonAction(_ sender: NSButton) {
-        guard updaterPermitted() else { return }
+        guard updaterPermitted(.roms) else { return }
 
         romsUpdateButton.isHidden = true
         romsUpdateProgressIndicator.isHidden = false
@@ -711,7 +1003,7 @@ class VersionManagerViewController: NSViewController {
 
     // MacBox update button action
     @IBAction func macboxUpdateButtonAction(_ sender: NSButton) {
-        guard updaterPermitted() else { return }
+        guard updaterPermitted(.macbox) else { return }
 
         macboxUpdateButton.isHidden = true
         macboxUpdateProgressIndicator.isHidden = false
