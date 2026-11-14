@@ -158,6 +158,9 @@ class AddVMViewController: NSViewController {
     
     // Add VM button action
     @IBAction func addVMButtonAction(_ sender: NSButton) {
+        #if MACBOX_RELEASE_TEST
+        return
+        #endif
         // Check if VM name was provided
         if vmNameTextField.stringValue.isEmpty {
             vmNameTextField.backgroundColor = .systemRed

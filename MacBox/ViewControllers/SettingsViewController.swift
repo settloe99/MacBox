@@ -23,7 +23,9 @@ class SettingsViewController: NSViewController {
     private let fileManager = FileManager.default
     private var macboxCustomPathString: String?
     private var emulatorCustomPathString: String?
-    #if DEBUG
+    #if MACBOX_RELEASE_TEST
+        private let defaultHomeDir = URL(fileURLWithPath: "MacBox-ReleaseTest", isDirectory: true, relativeTo: FileManager.default.homeDirectoryForCurrentUser)
+    #elseif DEBUG
         private let defaultHomeDir = URL(fileURLWithPath: "MacBox-Dev", isDirectory: true, relativeTo: FileManager.default.homeDirectoryForCurrentUser)
     #else
         private let defaultHomeDir = URL(fileURLWithPath: "MacBox", isDirectory: true, relativeTo: FileManager.default.homeDirectoryForCurrentUser)
@@ -117,7 +119,7 @@ class SettingsViewController: NSViewController {
 
     // Move MacBox home directory to custom location
     private func relocateHomeDir(destination: URL?) {
-        #if DEBUG
+        #if DEBUG || MACBOX_RELEASE_TEST
         NSLog("MacBoxDev: storage relocation disabled.")
         return
         #endif

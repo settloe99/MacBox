@@ -39,7 +39,9 @@ class MainViewController: NSViewController {
     let screensaverManager = ScreensaverManager()
     private let userDefaults = UserDefaults.standard
     private let fileManager = FileManager.default
-    #if DEBUG
+    #if MACBOX_RELEASE_TEST
+        var homeDirURL = URL(fileURLWithPath: "MacBox-ReleaseTest", isDirectory: true, relativeTo: FileManager.default.homeDirectoryForCurrentUser)
+    #elseif DEBUG
         var homeDirURL = URL(fileURLWithPath: "MacBox-Dev", isDirectory: true, relativeTo: FileManager.default.homeDirectoryForCurrentUser)
     #else
         var homeDirURL = URL(fileURLWithPath: "MacBox", isDirectory: true, relativeTo: FileManager.default.homeDirectoryForCurrentUser)
@@ -126,6 +128,11 @@ class MainViewController: NSViewController {
 
     // Set 86Box default path
     private func setEmulatorDefaultPath() {
+        #if MACBOX_RELEASE_TEST
+        versionInfoObject.emulatorCustomUrl = fileManager.homeDirectoryForCurrentUser
+            .appendingPathComponent("MacBox-ReleaseTest/86Box.app")
+        return
+        #endif
         if let defaultPath = userDefaults.string(forKey: "emulatorDefaultPath") {
             if defaultPath != "auto" {
                 if #available(macOS 13.0, *) {
@@ -184,7 +191,13 @@ class MainViewController: NSViewController {
 
     // Set MacBox home directory path
     private func setHomeDir() {
-        #if DEBUG
+        #if MACBOX_RELEASE_TEST
+        homeDirURL = URL(
+            fileURLWithPath: "MacBox-ReleaseTest",
+            isDirectory: true,
+            relativeTo: fileManager.homeDirectoryForCurrentUser
+        )
+        #elseif DEBUG
         // Development builds must always use isolated storage.
         homeDirURL = URL(
             fileURLWithPath: "MacBox-Dev",
@@ -336,7 +349,7 @@ class MainViewController: NSViewController {
         else {
             // Only discover globally registered 86Box in Release builds.
             // Development builds must not select the production emulator.
-            #if !DEBUG
+            #if !DEBUG && !MACBOX_RELEASE_TEST
             if let bundleURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "net.86Box.86Box") {
                 versionInfoObject.emulatorAutoUrl = bundleURL
                 localUrl = bundleURL
@@ -370,7 +383,7 @@ class MainViewController: NSViewController {
 
     // Check all possible locations for 86Box ROMs
     func checkForRoms() {
-        #if DEBUG
+        #if DEBUG || MACBOX_RELEASE_TEST
         NSLog("MacBoxDev: global ROM discovery disabled.")
         return
         #endif
@@ -683,7 +696,7 @@ class MainViewController: NSViewController {
 
     // Add VM to the table view
     func addVM(vm: VM, vmTemplate: VMTemplate? = nil) {
-        #if DEBUG
+        #if DEBUG || MACBOX_RELEASE_TEST
         NSLog("MacBoxDev: VM creation and import disabled during isolation testing.")
         return
         #endif
@@ -904,7 +917,7 @@ class MainViewController: NSViewController {
 
     // Start VM process
     private func startVM(launchSettings: Bool = false) {
-        #if DEBUG
+        #if DEBUG || MACBOX_RELEASE_TEST
         NSLog("MacBoxDev: VM launching disabled during isolation testing.")
         return
         #endif

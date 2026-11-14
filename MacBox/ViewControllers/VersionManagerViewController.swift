@@ -41,7 +41,9 @@ class VersionManagerViewController: NSViewController {
     let dateFormatter = DateFormatter()
     private let userDefaults = UserDefaults.standard
     private let fileManager = FileManager.default
-    #if DEBUG
+    #if MACBOX_RELEASE_TEST
+        private let homeDirURL = URL(fileURLWithPath: "MacBox-ReleaseTest", isDirectory: true, relativeTo: FileManager.default.homeDirectoryForCurrentUser)
+    #elseif DEBUG
         private let homeDirURL = URL(fileURLWithPath: "MacBox-Dev", isDirectory: true, relativeTo: FileManager.default.homeDirectoryForCurrentUser)
     #else
         private let homeDirURL = URL(fileURLWithPath: "MacBox", isDirectory: true, relativeTo: FileManager.default.homeDirectoryForCurrentUser)
@@ -105,7 +107,58 @@ class VersionManagerViewController: NSViewController {
 
     // Prevent updater operations during initial development testing
     private func updaterPermitted(_ type: updateType) -> Bool {
-        #if DEBUG
+        #if MACBOX_RELEASE_TEST
+        guard type == .emulator else {
+            return false
+        }
+
+        let fm = FileManager.default
+        let root = fm.homeDirectoryForCurrentUser
+            .appendingPathComponent(
+                "MacBox-ReleaseTest",
+                isDirectory: true
+            ).standardizedFileURL
+
+        let expected = root
+            .appendingPathComponent(
+                "86Box.app",
+                isDirectory: true
+            ).standardizedFileURL
+
+        var isDirectory: ObjCBool = false
+
+        guard fm.fileExists(
+            atPath: root.path,
+            isDirectory: &isDirectory
+        ),
+        isDirectory.boolValue,
+        root.path == root.resolvingSymlinksInPath().path else {
+            NSLog("MacBoxReleaseTest: Unsafe working directory.")
+            return false
+        }
+
+        guard (try? fm.destinationOfSymbolicLink(
+            atPath: expected.path
+        )) == nil else {
+            NSLog("MacBoxReleaseTest: Symbolic link rejected.")
+            return false
+        }
+
+        if fm.fileExists(atPath: expected.path) {
+            guard expected.path ==
+                expected.resolvingSymlinksInPath().path,
+                let bundle = Bundle(url: expected),
+                bundle.bundleIdentifier == "net.86Box.86Box" else {
+                NSLog("MacBoxReleaseTest: Invalid emulator.")
+                return false
+            }
+        }
+
+        NSLog("MacBoxReleaseTest: Emulator installation permitted.")
+        return true
+
+        #elseif DEBUG
+
         // ROM and MacBox self-updates remain disabled.
         switch type {
         case .roms, .macbox:
@@ -208,7 +261,19 @@ class VersionManagerViewController: NSViewController {
             // Set update buttons visibility
             setUpdateButtons()
 
-                #if DEBUG
+                #if MACBOX_RELEASE_TEST
+                let testApp = FileManager.default.homeDirectoryForCurrentUser
+                    .appendingPathComponent("MacBox-ReleaseTest/86Box.app")
+
+                emulatorUpdateButton.title = FileManager.default.fileExists(
+                    atPath: testApp.path
+                ) ? "Update" : "Install"
+
+                emulatorUpdateButton.isEnabled = updaterPermitted(.emulator)
+                romsUpdateButton.isEnabled = false
+                macboxUpdateButton.isEnabled = false
+
+                #elseif DEBUG
                 let devApp = FileManager.default.homeDirectoryForCurrentUser
                     .appendingPathComponent("MacBox-Dev/86Box.app")
 
@@ -468,7 +533,10 @@ class VersionManagerViewController: NSViewController {
     private func updateEmulatorBinary(location: URL) {
         let destination: URL
 
-        #if DEBUG
+        #if MACBOX_RELEASE_TEST
+        destination = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("MacBox-ReleaseTest/86Box.app")
+        #elseif DEBUG
         // Development builds may only install into MacBox-Dev.
         destination = FileManager.default
             .homeDirectoryForCurrentUser
@@ -553,7 +621,9 @@ class VersionManagerViewController: NSViewController {
             let installed = installedAppURL.standardizedFileURL
             let root = installed.deletingLastPathComponent()
 
-            #if DEBUG
+            #if MACBOX_RELEASE_TEST
+            let workingRoot = root
+            #elseif DEBUG
             // Preserve the development directories we have already tested.
             let workingRoot = root
             #else
@@ -584,7 +654,15 @@ class VersionManagerViewController: NSViewController {
                 throw fail("Invalid 86Box installation destination.")
             }
 
-            #if DEBUG
+            #if MACBOX_RELEASE_TEST
+            let testDestination = fm.homeDirectoryForCurrentUser
+                .appendingPathComponent("MacBox-ReleaseTest/86Box.app")
+                .standardizedFileURL
+
+            guard installed.path == testDestination.path else {
+                throw fail("Release-Test cannot modify production 86Box.")
+            }
+            #elseif DEBUG
             let expected = fm.homeDirectoryForCurrentUser
                 .appendingPathComponent("MacBox-Dev/86Box.app")
                 .standardizedFileURL
@@ -917,6 +995,7 @@ class VersionManagerViewController: NSViewController {
             do {
                 // Install the staged replacement using a local move.
                 try fm.moveItem(at: incoming, to: installed)
+
                 let checked = try verify(installed)
 
                 guard checked.0 == replacement.0,
@@ -1014,7 +1093,7 @@ class VersionManagerViewController: NSViewController {
 
     // Update 86Box ROMs with the new version
     private func updateRomsFile(location: URL) {
-        #if DEBUG
+        #if DEBUG || MACBOX_RELEASE_TEST
         NSLog("MacBoxDev: ROM installation blocked.")
         return
         #endif
@@ -1129,7 +1208,7 @@ class VersionManagerViewController: NSViewController {
 
     // Update MacBox binary with the new version
     private func updateMacBoxBinary(location: URL) {
-        #if DEBUG
+        #if DEBUG || MACBOX_RELEASE_TEST
         NSLog("MacBoxDev: application self-update blocked.")
         return
         #endif
