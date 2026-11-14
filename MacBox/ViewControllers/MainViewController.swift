@@ -157,14 +157,8 @@ class MainViewController: NSViewController {
 
             guard !parkedNames.isEmpty else { return }
 
-            // Never overwrite an existing application.
-            guard !fm.fileExists(atPath: installed.path),
-                (try? fm.destinationOfSymbolicLink(
-                    atPath: installed.path
-                )) == nil else {
-                NSLog("MacBoxReleaseTest: Existing application preserved.")
-                return
-            }
+            // Check whether the installed application exists after
+            // validating the parked previous version below.
 
             guard parkedNames.count == 1 else {
                 NSLog("MacBoxReleaseTest: Ambiguous recovery candidates.")
@@ -221,11 +215,258 @@ class MainViewController: NSViewController {
                 return version
             }
 
+
             guard let originalVersion = verifiedVersion(parked) else {
                 NSLog("MacBoxReleaseTest: Parked emulator verification failed.")
                 return
             }
 
+            // An installed application may already be present if MacBox
+            // crashed after replacement but before cleanup.
+            let destinationOccupied =
+                fm.fileExists(atPath: installed.path) ||
+                (try? fm.destinationOfSymbolicLink(
+                    atPath: installed.path
+                )) != nil
+
+            if destinationOccupied {
+                let installedVersion = verifiedVersion(installed)
+                let message: String
+
+                if let installedVersion = installedVersion {
+                    let isNewer = installedVersion.compare(
+                        originalVersion,
+                        options: .numeric
+                    ) == .orderedDescending
+
+                    if isNewer {
+                        message = """
+                        An interrupted 86Box update was detected.
+
+                        Installed version: \(installedVersion)
+                        Previous version: \(originalVersion)
+
+                        Both applications passed verification.
+
+                        The installed application has been preserved.
+                        The previous application has also been retained.
+
+                        No files have been changed.
+
+                        Further updates remain blocked until the
+                        interrupted transaction has been reviewed.
+                        """
+                    } else {
+                        message = """
+                        An interrupted 86Box update was detected.
+
+                        Installed version: \(installedVersion)
+                        Parked version: \(originalVersion)
+
+                        Both applications passed verification, but
+                        their version order is unexpected.
+
+                        No files have been changed.
+                        Manual review is required.
+                        """
+                    }
+                } else {
+                    message = """
+                    An interrupted 86Box update was detected.
+
+                    The installed application could not be verified.
+                    The parked previous version passed verification.
+
+                    Neither application has been modified.
+
+                    Manual recovery is required.
+                    """
+                }
+
+                NSLog("MacBoxReleaseTest: %@", message)
+
+
+                let canArchive = verifiedVersion(installed).map {
+                    $0.compare(
+                        originalVersion,
+                        options: .numeric
+                    ) == .orderedDescending
+                } ?? false
+
+                DispatchQueue.main.async {
+                    let alert = NSAlert()
+                    alert.alertStyle = .warning
+                    alert.messageText =
+                        "Interrupted 86Box update detected"
+                    alert.informativeText = message
+
+                    if canArchive {
+                        alert.addButton(
+                            withTitle: "Keep installed and archive previous"
+                        )
+                        alert.addButton(withTitle: "Leave unchanged")
+                    } else {
+                        alert.addButton(withTitle: "OK")
+                    }
+
+                    let response = alert.runModal()
+
+                    guard canArchive,
+                          response == .alertFirstButtonReturn else {
+                        return
+                    }
+
+                    do {
+                        func recoveryError(_ text: String) -> NSError {
+                            NSError(
+                                domain: "MacBoxReleaseTest.Recovery",
+                                code: 1,
+                                userInfo: [
+                                    NSLocalizedDescriptionKey: text
+                                ]
+                            )
+                        }
+
+                        // Revalidate both applications immediately
+                        // before making any filesystem changes.
+                        guard let current = verifiedVersion(installed),
+                              current.compare(
+                                originalVersion,
+                                options: .numeric
+                              ) == .orderedDescending,
+                              verifiedVersion(parked) == originalVersion else {
+                            throw recoveryError(
+                                "Application verification changed. " +
+                                "No recovery files have been removed."
+                            )
+                        }
+
+                        let names = try fm.contentsOfDirectory(
+                            atPath: root.path
+                        )
+
+                        let parkedNames = names.filter {
+                            $0.hasPrefix(prefix) &&
+                            $0.hasSuffix(".app")
+                        }
+
+                        let incomingNames = names.filter {
+                            $0.hasPrefix(".MacBox-86Box-incoming-") &&
+                            $0.hasSuffix(".app")
+                        }
+
+                        guard parkedNames.count == 1,
+                              parkedNames[0] == name,
+                              incomingNames.isEmpty else {
+                            throw recoveryError(
+                                "Additional transaction files were found. " +
+                                "Manual review is required."
+                            )
+                        }
+
+                        let backups = root.appendingPathComponent(
+                            "86Box-backups",
+                            isDirectory: true
+                        )
+
+                        // The backup directory must already exist
+                        // and must not redirect through a symlink.
+                        guard backups.standardizedFileURL.path ==
+                                backups.resolvingSymlinksInPath()
+                                    .standardizedFileURL.path,
+                              let attributes = try? fm.attributesOfItem(
+                                atPath: backups.path
+                              ),
+                              attributes[.type] as? FileAttributeType ==
+                                .typeDirectory else {
+                            throw recoveryError(
+                                "The backup directory is missing or unsafe."
+                            )
+                        }
+
+                        // Use a distinct name so existing automatic
+                        // backups are never overwritten.
+                        let archive = backups.appendingPathComponent(
+                            "86Box-recovered-\(identifier).app",
+                            isDirectory: true
+                        )
+
+                        guard !fm.fileExists(atPath: archive.path),
+                              (try? fm.destinationOfSymbolicLink(
+                                atPath: archive.path
+                              )) == nil else {
+                            throw recoveryError(
+                                "The recovery archive already exists."
+                            )
+                        }
+
+                        // Preserve the parked application before
+                        // removing anything from its original location.
+                        try fm.copyItem(at: parked, to: archive)
+
+                        guard verifiedVersion(archive) ==
+                                originalVersion else {
+                            throw recoveryError(
+                                "The archived application failed verification. " +
+                                "The parked application has been preserved."
+                            )
+                        }
+
+                        // The backup is verified. Remove the parked copy
+                        // to resolve the interrupted transaction.
+                        try fm.removeItem(at: parked)
+
+                        NSLog(
+                            "MacBoxReleaseTest: Previous 86Box archived at %@",
+                            archive.path
+                        )
+
+                        let success = NSAlert()
+                        success.alertStyle = .informational
+                        success.messageText =
+                            "86Box recovery completed"
+                        success.informativeText = """
+                        Installed version: \(current)
+                        Archived version: \(originalVersion)
+
+                        The previous emulator has been safely archived at:
+
+                        \(archive.path)
+
+                        Future updates are no longer blocked by this interrupted transaction.
+                        """
+                        success.addButton(withTitle: "OK")
+                        success.runModal()
+
+                    } catch {
+                        NSLog(
+                            "MacBoxReleaseTest: Recovery failed: %@",
+                            error.localizedDescription
+                        )
+
+                        let failure = NSAlert()
+                        failure.alertStyle = .critical
+                        failure.messageText =
+                            "86Box recovery could not be completed"
+                        failure.informativeText = """
+                        \(error.localizedDescription)
+
+                        The recovery process has not deliberately
+                        removed an unverified application.
+
+                        Please review the installation and backup
+                        directories before trying again.
+                        """
+                        failure.addButton(withTitle: "OK")
+                        failure.runModal()
+                    }
+                }
+
+                return
+            }
+
+            // The normal installation is missing.
+            // Restore the verified parked application.
             do {
                 try fm.moveItem(at: parked, to: installed)
 
