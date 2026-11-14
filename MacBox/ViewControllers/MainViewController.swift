@@ -86,6 +86,11 @@ class MainViewController: NSViewController {
         initFiles()
         // Set screensaver & screen sleep preference
         setScreenSaver()
+        // Recover a valid previous emulator before detecting 86Box.
+        #if MACBOX_RELEASE_TEST
+        recoverInterrupted86BoxIfNeeded()
+        #endif
+
         // Check for 86Box version
         setEmulatorDefaultPath()
         setEmulatorUpdateChannel()
@@ -126,8 +131,127 @@ class MainViewController: NSViewController {
         }
     }
 
-    // Set 86Box default path
-    private func setEmulatorDefaultPath() {
+        #if MACBOX_RELEASE_TEST
+        private func recoverInterrupted86BoxIfNeeded() {
+            let fm = FileManager.default
+            let root = fm.homeDirectoryForCurrentUser
+                .appendingPathComponent(
+                    "MacBox-ReleaseTest",
+                    isDirectory: true
+                ).standardizedFileURL
+
+            let installed = root.appendingPathComponent("86Box.app")
+            let prefix = ".MacBox-86Box-previous-"
+
+            guard root.path == root.resolvingSymlinksInPath().path,
+                let names = try? fm.contentsOfDirectory(
+                    atPath: root.path
+                ) else {
+                NSLog("MacBoxReleaseTest: Unsafe recovery directory.")
+                return
+            }
+
+            let parkedNames = names.filter {
+                $0.hasPrefix(prefix) && $0.hasSuffix(".app")
+            }
+
+            guard !parkedNames.isEmpty else { return }
+
+            // Never overwrite an existing application.
+            guard !fm.fileExists(atPath: installed.path),
+                (try? fm.destinationOfSymbolicLink(
+                    atPath: installed.path
+                )) == nil else {
+                NSLog("MacBoxReleaseTest: Existing application preserved.")
+                return
+            }
+
+            guard parkedNames.count == 1 else {
+                NSLog("MacBoxReleaseTest: Ambiguous recovery candidates.")
+                return
+            }
+
+            let name = parkedNames[0]
+            let identifier = String(
+                name.dropFirst(prefix.count).dropLast(4)
+            )
+
+            guard UUID(uuidString: identifier) != nil else {
+                NSLog("MacBoxReleaseTest: Invalid transaction identifier.")
+                return
+            }
+
+            let parked = root.appendingPathComponent(name)
+
+            func verifiedVersion(_ app: URL) -> String? {
+                guard app.path ==
+                        app.resolvingSymlinksInPath().path,
+                    let attributes = try? fm.attributesOfItem(
+                        atPath: app.path
+                    ),
+                    attributes[.type] as? FileAttributeType ==
+                        .typeDirectory,
+                    let bundle = Bundle(url: app),
+                    bundle.bundleIdentifier == "net.86Box.86Box",
+                    let version = bundle.infoDictionary?[
+                        "CFBundleVersion"
+                    ] as? String else {
+                    return nil
+                }
+
+                do {
+                    let process = Process()
+                    process.executableURL = URL(
+                        fileURLWithPath: "/usr/bin/codesign"
+                    )
+                    process.arguments = [
+                        "--verify", "--deep", "--strict", app.path
+                    ]
+
+                    try process.run()
+                    process.waitUntilExit()
+
+                    guard process.terminationStatus == 0 else {
+                        return nil
+                    }
+                } catch {
+                    return nil
+                }
+
+                return version
+            }
+
+            guard let originalVersion = verifiedVersion(parked) else {
+                NSLog("MacBoxReleaseTest: Parked emulator verification failed.")
+                return
+            }
+
+            do {
+                try fm.moveItem(at: parked, to: installed)
+
+                guard verifiedVersion(installed) == originalVersion else {
+                    // Attempt to return the application to its parked path.
+                    try fm.moveItem(at: installed, to: parked)
+                    NSLog("MacBoxReleaseTest: Restoration verification failed.")
+                    return
+                }
+
+                NSLog(
+                    "MacBoxReleaseTest: Recovered 86Box version %@",
+                    originalVersion
+                )
+            } catch {
+                NSLog(
+                    "MacBoxReleaseTest: Automatic recovery failed: %@",
+                    error.localizedDescription
+                )
+            }
+        }
+        #endif
+
+        // Set 86Box default path
+        private func setEmulatorDefaultPath() {
+
         #if MACBOX_RELEASE_TEST
         versionInfoObject.emulatorCustomUrl = fileManager.homeDirectoryForCurrentUser
             .appendingPathComponent("MacBox-ReleaseTest/86Box.app")

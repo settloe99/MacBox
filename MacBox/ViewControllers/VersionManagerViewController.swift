@@ -740,6 +740,28 @@ class VersionManagerViewController: NSViewController {
             // Never trust an application preference for this destination.
             try requireRealDirectory(root)
 
+            // Detect incomplete transactions from a previous update.
+            // Do not start another installation until recovery is complete.
+            let transactionEntries = try fm.contentsOfDirectory(
+                atPath: root.path
+            )
+
+            let unfinishedTransactions = transactionEntries.filter { name in
+                (name.hasPrefix(".MacBox-86Box-previous-") ||
+                 name.hasPrefix(".MacBox-86Box-incoming-")) &&
+                name.hasSuffix(".app")
+            }
+
+            guard unfinishedTransactions.isEmpty else {
+                throw fail(
+                    "An interrupted 86Box update was detected. " +
+                    "No files have been changed. " +
+                    "Recovery is required before another installation. " +
+                    "Remaining files: " +
+                    unfinishedTransactions.joined(separator: ", ")
+                )
+            }
+
             let hasExistingInstallation: Bool
 
             if fm.fileExists(atPath: installed.path) {
