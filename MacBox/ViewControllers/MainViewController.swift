@@ -357,7 +357,9 @@ class MainViewController: NSViewController {
                     }
                     // Get the 86Box bundle version
                     if let bundleVersion = bundle.infoDictionary?["CFBundleVersion"] as? String {
-                        emulatorBuildVer = String((bundleVersion).suffix(4))
+                        // 86Box build numbers can contain more than four digits.
+                        // Read the complete final version component.
+                        emulatorBuildVer = bundleVersion.components(separatedBy: ".").last ?? bundleVersion
                     }
                 }
             }

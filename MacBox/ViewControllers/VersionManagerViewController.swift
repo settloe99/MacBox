@@ -283,25 +283,64 @@ class VersionManagerViewController: NSViewController {
         let versionInfoObject = MainViewController.instance.versionInfoObject
 
         for asset in versionInfoObject.emulatorUpdateObject?.assets ?? [] {
-            if let downloadURL = asset.browser_download_url {
-                if isStableChannel {
-                    // Stable
-                    if downloadURL.lowercased().contains("macos") {
-                        if let url = URL(string: downloadURL) {
-                            downloadEmulatorBinary(url: url)
-                        }
-                    }
-                }
-                else {
-                    // Experimental
-                    if downloadURL.lowercased().contains("recommended") && downloadURL.lowercased().contains("macos") {
-                        if let url = URL(string: "https://ci.86box.net/job/86Box/lastSuccessfulBuild/artifact/" + downloadURL) {
-                            downloadEmulatorBinary(url: url)
-                        }
-                    }
-                }
+            guard let downloadURL = asset.browser_download_url else {
+                continue
             }
+
+            if isStableChannel {
+                // Stable releases use GitHub download URLs.
+                guard downloadURL.lowercased().contains("macos"),
+                    let url = URL(string: downloadURL) else {
+                    continue
+                }
+
+                downloadEmulatorBinary(url: url)
+                return
+            }
+
+            // Experimental releases use Jenkins artifact paths.
+            let filename = (downloadURL as NSString)
+                .lastPathComponent.lowercased()
+
+            guard filename.hasSuffix(".zip"),
+                filename.contains("macos"),
+                filename.contains("arm64"),
+                !downloadURL.hasPrefix("/"),
+                !downloadURL.contains(".."),
+                let buildString = versionInfoObject.emulatorUpdateObject?.tag_name,
+                let buildNumber = Int(buildString),
+                buildNumber > 0 else {
+                continue
+            }
+
+            var components = URLComponents()
+            components.scheme = "https"
+            components.host = "ci.86box.net"
+            components.path = "/job/86Box/\(buildNumber)/artifact/\(downloadURL)"
+
+            guard let url = components.url else {
+                continue
+            }
+
+            NSLog("MacBox: Selected 86Box download: %@", url.absoluteString)
+            downloadEmulatorBinary(url: url)
+            return
         }
+
+        // No compatible download was found.
+        emulatorUpdateProgressIndicator.isHidden = true
+        emulatorUpdateButton.isHidden = false
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "No compatible 86Box download found"
+        alert.informativeText = """
+        The update server did not provide a compatible macOS
+        archive for the selected release.
+
+        The existing 86Box installation has not been changed.
+        """
+        alert.runModal()
     }
 
     // Download 86Box binary
@@ -333,21 +372,35 @@ class VersionManagerViewController: NSViewController {
 
         let versionInfoObject = MainViewController.instance.versionInfoObject
 
-        var tempURL = homeDirURL
-        tempURL.appendPathComponent("tmp")
+        // Create a unique staging directory for each update attempt.
+        // Previous incomplete updates must not affect new installations.
+        let tempURL = homeDirURL
+            .appendingPathComponent("tmp", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
 
-        var fileURL = tempURL
-        fileURL.appendPathComponent(location.lastPathComponent + ".zip")
+        let fileURL = tempURL.appendingPathComponent("86Box-download.zip")
 
-        var emulatorDefaultInstallationURL = homeDirURL
-        emulatorDefaultInstallationURL.appendPathComponent("86Box.app")
+        let emulatorDefaultInstallationURL = homeDirURL
+            .appendingPathComponent("86Box.app")
 
-        var unzippedEmulatorFileURL = tempURL
-        unzippedEmulatorFileURL.appendPathComponent("86Box.app")
+        let unzippedEmulatorFileURL = tempURL
+            .appendingPathComponent("86Box.app")
 
         do {
-            // Create the tmp directory
-            try fileManager.createDirectory(at: tempURL, withIntermediateDirectories: true, attributes: nil)
+            try fileManager.createDirectory(
+                at: tempURL,
+                withIntermediateDirectories: true,
+                attributes: nil
+            )
+
+            // Clean up this attempt's staging directory on success or failure.
+            defer {
+                do {
+                    try fileManager.removeItem(at: tempURL)
+                } catch {
+                    NSLog("MacBox: Temporary cleanup failed: \(error.localizedDescription)")
+                }
+            }
             // Move the downloaded file into the tmp directory
             try fileManager.moveItem(at: location, to: URL(fileURLWithPath: fileURL.path))
             // Unzip the file
@@ -382,7 +435,8 @@ class VersionManagerViewController: NSViewController {
                 }
                 // Get the 86Box bundle version
                 if let bundleVersion = bundle.infoDictionary?["CFBundleVersion"] as? String {
-                    binaryBuildVer = String((bundleVersion).suffix(4))
+                    // Preserve the complete 86Box build number.
+                    binaryBuildVer = bundleVersion.components(separatedBy: ".").last ?? bundleVersion
                 }
             }
 
@@ -406,9 +460,6 @@ class VersionManagerViewController: NSViewController {
                 // Update version info
                 MainViewController.instance.checkFor86Box(url: emulatorDefaultInstallationURL, appVer: binaryAppVer, buildVer: binaryBuildVer)
             }
-
-            // Delete temporary file
-            deleteTmpFile(url: fileURL)
 
             // Update buttons status
             emulatorUpdateProgressIndicator.isHidden = true
@@ -676,17 +727,69 @@ class VersionManagerViewController: NSViewController {
 extension VersionManagerViewController: URLSessionDownloadDelegate {
 
     // Handle files download
-    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
-        if let info = downloadTasks.first(where: { $0.downloadTask == downloadTask }) {
-            if info.type == .emulator {
-                updateEmulatorBinary(location: location)
+    func urlSession(
+        _ session: URLSession,
+        downloadTask: URLSessionDownloadTask,
+        didFinishDownloadingTo location: URL
+    ) {
+        guard let info = downloadTasks.first(where: {
+            $0.downloadTask == downloadTask
+        }) else {
+            return
+        }
+
+        if info.type == .emulator {
+            let response = downloadTask.response as? HTTPURLResponse
+            let statusCode = response?.statusCode ?? 0
+            let contentType = response?
+                .value(forHTTPHeaderField: "Content-Type") ?? "Unknown"
+
+            // Check the actual ZIP signature, not the filename.
+            let signature: Data? = {
+                guard let handle = try? FileHandle(forReadingFrom: location)
+                else {
+                    return nil
+                }
+
+                defer { handle.closeFile() }
+                return handle.readData(ofLength: 4)
+            }()
+
+            let validZip = signature == Data([0x50, 0x4B, 0x03, 0x04])
+
+            guard statusCode == 200 && validZip else {
+                NSLog(
+                    "MacBox: Invalid emulator download. HTTP %d, type: %@",
+                    statusCode,
+                    contentType
+                )
+
+                info.progressIndicator.isHidden = true
+                info.updateButton.isHidden = false
+
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                alert.messageText = "86Box download failed"
+                alert.informativeText = """
+                The update server did not return a valid ZIP archive.
+
+                HTTP status: \(statusCode)
+                Content type: \(contentType)
+
+                The existing 86Box installation has not been changed.
+                """
+                alert.addButton(withTitle: "OK")
+                alert.runModal()
+                return
             }
-            else if info.type == .roms {
-                updateRomsFile(location: location)
-            }
-            else {
-                updateMacBoxBinary(location: location)
-            }
+
+            updateEmulatorBinary(location: location)
+
+        } else if info.type == .roms {
+            updateRomsFile(location: location)
+
+        } else {
+            updateMacBoxBinary(location: location)
         }
     }
 
