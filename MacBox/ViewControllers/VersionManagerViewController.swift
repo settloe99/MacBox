@@ -466,143 +466,80 @@ class VersionManagerViewController: NSViewController {
 
     // Update 86Box binary with the new version
     private func updateEmulatorBinary(location: URL) {
+        let destination: URL
+
         #if DEBUG
-                do {
-                    let (appVersion, buildVersion) =
-                        try installVerifiedEmulator(
-                            from: location,
-                            installedAppURL: FileManager.default
-                                .homeDirectoryForCurrentUser
-                                .appendingPathComponent("MacBox-Dev/86Box.app")
-                        )
+        // Development builds may only install into MacBox-Dev.
+        destination = FileManager.default
+            .homeDirectoryForCurrentUser
+            .appendingPathComponent(
+                "MacBox-Dev/86Box.app",
+                isDirectory: true
+            )
+        #else
+        // Preserve the user's selected emulator location.
+        let versionInfoObject =
+            MainViewController.instance.versionInfoObject
 
-                    let destination = FileManager.default
-                        .homeDirectoryForCurrentUser
-                        .appendingPathComponent("MacBox-Dev/86Box.app")
-
-                    MainViewController.instance.checkFor86Box(
-                        url: destination,
-                        appVer: appVersion,
-                        buildVer: buildVersion
-                    )
-
-                    emulatorUpdateProgressIndicator.isHidden = true
-                    emulatorUpdateButton.isHidden = true
-                    emulatorUpdateCheckImageView.isHidden = false
-
-                } catch {
-                    emulatorUpdateProgressIndicator.isHidden = true
-                    emulatorUpdateButton.isHidden = false
-
-                    let alert = NSAlert()
-                    alert.alertStyle = .warning
-                    alert.messageText = "86Box installation failed"
-                    alert.informativeText = error.localizedDescription
-                    alert.runModal()
-                }
-                return
+        destination = versionInfoObject.emulatorCustomUrl
+            ?? versionInfoObject.emulatorAutoUrl
+            ?? homeDirURL.appendingPathComponent(
+                "86Box.app",
+                isDirectory: true
+            )
         #endif
 
-        let versionInfoObject = MainViewController.instance.versionInfoObject
-
-        // Create a unique staging directory for each update attempt.
-        // Previous incomplete updates must not affect new installations.
-        let tempURL = homeDirURL
-            .appendingPathComponent("tmp", isDirectory: true)
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-
-        let fileURL = tempURL.appendingPathComponent("86Box-download.zip")
-
-        let emulatorDefaultInstallationURL = homeDirURL
-            .appendingPathComponent("86Box.app")
-
-        let unzippedEmulatorFileURL = tempURL
-            .appendingPathComponent("86Box.app")
-
         do {
-            try fileManager.createDirectory(
-                at: tempURL,
-                withIntermediateDirectories: true,
-                attributes: nil
+            let installationURL = destination.standardizedFileURL
+
+            // The shared installer validates the destination,
+            // downloaded application, version and code signature.
+            // It also handles backups and rollback.
+            let (appVersion, buildVersion) =
+                try installVerifiedEmulator(
+                    from: location,
+                    installedAppURL: installationURL
+                )
+
+            // Record the successfully installed version.
+            emulatorUpdatedURL = installationURL
+            emulatorUpdatedAppVer = appVersion
+            emulatorUpdatedBuildVer = buildVersion
+
+            // Refresh MacBox's emulator information.
+            MainViewController.instance.checkFor86Box(
+                url: installationURL,
+                appVer: appVersion,
+                buildVer: buildVersion
             )
 
-            // Clean up this attempt's staging directory on success or failure.
-            defer {
-                do {
-                    try fileManager.removeItem(at: tempURL)
-                } catch {
-                    NSLog("MacBox: Temporary cleanup failed: \(error.localizedDescription)")
-                }
-            }
-            // Move the downloaded file into the tmp directory
-            try fileManager.moveItem(at: location, to: URL(fileURLWithPath: fileURL.path))
-            // Unzip the file
-            try fileManager.unzipItem(at: fileURL, to: tempURL)
-
-            var emulatorPath: URL?
-            if let emulatorCustomPath = versionInfoObject.emulatorCustomUrl?.path {
-                if #available(macOS 13.0, *) {
-                    emulatorPath = URL(filePath: emulatorCustomPath)
-                } else {
-                    // Fallback on earlier versions
-                    emulatorPath = URL(fileURLWithPath: emulatorCustomPath)
-                }
-            }
-            else if let emulatorAutoPath = versionInfoObject.emulatorAutoUrl?.path {
-                if #available(macOS 13.0, *) {
-                    emulatorPath = URL(filePath: emulatorAutoPath)
-                } else {
-                    // Fallback on earlier versions
-                    emulatorPath = URL(fileURLWithPath: emulatorAutoPath)
-                }
-            }
-
-            // Get 86Box info.plist
-            var binaryAppVer: String?
-            var binaryBuildVer: String?
-
-            if let bundle = Bundle(url: unzippedEmulatorFileURL) {
-                // Get the 86Box short version
-                if let shortVersion = bundle.infoDictionary?["CFBundleShortVersionString"] as? String {
-                    binaryAppVer = shortVersion
-                }
-                // Get the 86Box bundle version
-                if let bundleVersion = bundle.infoDictionary?["CFBundleVersion"] as? String {
-                    // Preserve the complete 86Box build number.
-                    binaryBuildVer = bundleVersion.components(separatedBy: ".").last ?? bundleVersion
-                }
-            }
-
-            // Set variables
-            emulatorUpdatedAppVer = binaryAppVer
-            emulatorUpdatedBuildVer = binaryBuildVer
-
-            if let path = emulatorPath {
-                // 86Box is installed; replace old binary with the updated one
-                let _ = try fileManager.replaceItemAt(path, withItemAt: unzippedEmulatorFileURL)
-                // Set variables
-                emulatorUpdatedURL = path
-                // Update version info
-                MainViewController.instance.checkFor86Box(url: path, appVer: binaryAppVer, buildVer: binaryBuildVer)
-            }
-            else {
-                // 86Box is not installed; install it in the MacBox folder
-                try fileManager.moveItem(at: unzippedEmulatorFileURL, to: emulatorDefaultInstallationURL)
-                // Set variables
-                emulatorUpdatedURL = emulatorDefaultInstallationURL
-                // Update version info
-                MainViewController.instance.checkFor86Box(url: emulatorDefaultInstallationURL, appVer: binaryAppVer, buildVer: binaryBuildVer)
-            }
-
-            // Update buttons status
+            // Update the Version Manager interface.
             emulatorUpdateProgressIndicator.isHidden = true
             emulatorUpdateButton.isHidden = true
             emulatorUpdateCheckImageView.isHidden = false
+
+            NSLog(
+                "MacBox: 86Box installation completed. Version %@, build %@",
+                appVersion,
+                buildVersion
+            )
+
         } catch {
-            print("Error: \(error.localizedDescription)")
+            NSLog(
+                "MacBox: 86Box installation failed: %@",
+                error.localizedDescription
+            )
 
             emulatorUpdateProgressIndicator.isHidden = true
             emulatorUpdateButton.isHidden = false
+            emulatorUpdateCheckImageView.isHidden = true
+
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "86Box installation failed"
+            alert.informativeText = error.localizedDescription
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
         }
     }
 
