@@ -149,31 +149,46 @@ class VersionManagerViewController: NSViewController {
             return false
         }
 
-        // Reject missing directories and symbolic-link redirection.
-        for directory in [root, expected] {
-            var isDirectory: ObjCBool = false
+        // The development root must exist and must not be a symlink.
+        var rootIsDirectory: ObjCBool = false
 
-            guard fm.fileExists(
-                atPath: directory.path,
-                isDirectory: &isDirectory
-            ),
-            isDirectory.boolValue,
-            directory.path ==
-                directory.resolvingSymlinksInPath()
-                    .standardizedFileURL.path else {
-                NSLog(
-                    "MacBoxDev: Unsafe directory: %@",
-                    directory.path
-                )
-                return false
-            }
+        guard fm.fileExists(
+            atPath: root.path,
+            isDirectory: &rootIsDirectory
+        ),
+        rootIsDirectory.boolValue,
+        root.path == root.resolvingSymlinksInPath()
+            .standardizedFileURL.path else {
+            NSLog("MacBoxDev: Unsafe development directory.")
+            return false
         }
 
-        // Make sure we're targeting an actual 86Box bundle.
-        guard let bundle = Bundle(url: expected),
-            bundle.bundleIdentifier == "net.86Box.86Box" else {
-            NSLog("MacBoxDev: Invalid 86Box bundle.")
+        // Reject symbolic links, including dangling links.
+        guard (try? fm.destinationOfSymbolicLink(
+            atPath: expected.path
+        )) == nil else {
+            NSLog("MacBoxDev: Emulator destination is a symbolic link.")
             return false
+        }
+
+        var appIsDirectory: ObjCBool = false
+
+        if fm.fileExists(
+            atPath: expected.path,
+            isDirectory: &appIsDirectory
+        ) {
+            // Existing installation: verify the application.
+            guard appIsDirectory.boolValue,
+                  expected.path == expected.resolvingSymlinksInPath()
+                    .standardizedFileURL.path,
+                  let bundle = Bundle(url: expected),
+                  bundle.bundleIdentifier == "net.86Box.86Box" else {
+                NSLog("MacBoxDev: Existing 86Box installation is invalid.")
+                return false
+            }
+        } else {
+            // Fresh installation: destination is empty.
+            NSLog("MacBoxDev: Fresh 86Box installation permitted.")
         }
 
         NSLog("MacBoxDev: Development emulator update permitted.")
@@ -193,11 +208,19 @@ class VersionManagerViewController: NSViewController {
             // Set update buttons visibility
             setUpdateButtons()
 
-            #if DEBUG
-            emulatorUpdateButton.isEnabled = updaterPermitted(.emulator)
-            romsUpdateButton.isEnabled = false
-            macboxUpdateButton.isEnabled = false
-            #endif
+                #if DEBUG
+                let devApp = FileManager.default.homeDirectoryForCurrentUser
+                    .appendingPathComponent("MacBox-Dev/86Box.app")
+
+                emulatorUpdateButton.title = FileManager.default.fileExists(
+                    atPath: devApp.path
+                ) ? "Update" : "Install"
+
+                emulatorUpdateButton.isEnabled = updaterPermitted(.emulator)
+                romsUpdateButton.isEnabled = false
+                macboxUpdateButton.isEnabled = false
+                #endif
+
         }
 
     // Populate 86Box update info
@@ -359,9 +382,14 @@ class VersionManagerViewController: NSViewController {
             }
 
             if isStableChannel {
-                // Stable releases use GitHub download URLs.
-                guard downloadURL.lowercased().contains("macos"),
-                    let url = URL(string: downloadURL) else {
+                let assetURL = downloadURL.lowercased()
+
+                guard assetURL.contains("macos"),
+                      assetURL.contains("arm64"),
+                      assetURL.hasSuffix(".zip"),
+                      let url = URL(string: downloadURL),
+                      url.scheme == "https",
+                      url.host == "github.com" else {
                     continue
                 }
 
@@ -369,18 +397,17 @@ class VersionManagerViewController: NSViewController {
                 return
             }
 
-            // Experimental releases use Jenkins artifact paths.
             let filename = (downloadURL as NSString)
                 .lastPathComponent.lowercased()
 
             guard filename.hasSuffix(".zip"),
-                filename.contains("macos"),
-                filename.contains("arm64"),
-                !downloadURL.hasPrefix("/"),
-                !downloadURL.contains(".."),
-                let buildString = versionInfoObject.emulatorUpdateObject?.tag_name,
-                let buildNumber = Int(buildString),
-                buildNumber > 0 else {
+                  filename.contains("macos"),
+                  filename.contains("arm64"),
+                  !downloadURL.hasPrefix("/"),
+                  !downloadURL.contains(".."),
+                  let buildString = versionInfoObject.emulatorUpdateObject?.tag_name,
+                  let buildNumber = Int(buildString),
+                  buildNumber > 0 else {
                 continue
             }
 
@@ -393,12 +420,15 @@ class VersionManagerViewController: NSViewController {
                 continue
             }
 
-            NSLog("MacBox: Selected 86Box download: %@", url.absoluteString)
+            NSLog(
+                "MacBox: Selected 86Box download: %@",
+                url.absoluteString
+            )
+
             downloadEmulatorBinary(url: url)
             return
         }
 
-        // No compatible download was found.
         emulatorUpdateProgressIndicator.isHidden = true
         emulatorUpdateButton.isHidden = false
 
@@ -694,7 +724,22 @@ class VersionManagerViewController: NSViewController {
 
             // Never trust an application preference for this destination.
             try requireRealDirectory(root)
-            try requireRealDirectory(installed)
+
+            let hasExistingInstallation: Bool
+
+            if fm.fileExists(atPath: installed.path) {
+                try requireRealDirectory(installed)
+                hasExistingInstallation = true
+            } else {
+                // Reject even a dangling symbolic link at the destination.
+                guard (try? fm.destinationOfSymbolicLink(
+                    atPath: installed.path
+                )) == nil else {
+                    throw fail("Unsafe installation destination.")
+                }
+
+                hasExistingInstallation = false
+            }
 
             #if !DEBUG
             try fm.createDirectory(
@@ -712,8 +757,6 @@ class VersionManagerViewController: NSViewController {
             ).isEmpty else {
                 throw fail("Close all running 86Box instances first.")
             }
-
-            let previous = try verify(installed)
 
             let stage = temporary.appendingPathComponent(
                 UUID().uuidString, isDirectory: true
@@ -748,15 +791,132 @@ class VersionManagerViewController: NSViewController {
             let candidate = stage.appendingPathComponent("86Box.app")
             let replacement = try verify(candidate)
 
-            guard !isStableChannel,
-                let expected = MainViewController.instance
-                    .versionInfoObject.emulatorUpdateObject?.tag_name,
-                replacement.1 == expected,
-                let newBuild = Int(replacement.1),
-                let oldBuild = Int(previous.1),
-                newBuild > oldBuild
-            else {
-                throw fail("Downloaded build does not match the expected newer experimental build.")
+            // Validate the downloaded application against the selected release.
+            guard let releaseTag = MainViewController.instance
+                .versionInfoObject.emulatorUpdateObject?.tag_name else {
+                throw fail("The selected release has no version information.")
+            }
+
+            if isStableChannel {
+                // Stable tags are formatted as v6.0, v6.1, etc.
+                guard releaseTag.lowercased().hasPrefix("v"),
+                    String(releaseTag.dropFirst()) == replacement.0,
+                    Int(replacement.1) != nil else {
+                    throw fail(
+                        "The downloaded application does not match the selected stable release."
+                    )
+                }
+            } else {
+                // Experimental tags contain Jenkins build numbers.
+                guard releaseTag == replacement.1,
+                    Int(replacement.1) != nil else {
+                    throw fail(
+                        "The downloaded application does not match the selected experimental build."
+                    )
+                }
+            }
+
+            // Fresh installations have no previous application to back up.
+            if !hasExistingInstallation {
+
+                let incoming = root.appendingPathComponent(
+                    ".MacBox-86Box-incoming-\(UUID().uuidString).app"
+                )
+
+                guard !fm.fileExists(atPath: incoming.path),
+                      (try? fm.destinationOfSymbolicLink(
+                        atPath: incoming.path
+                      )) == nil else {
+                    throw fail("Unsafe staging destination.")
+                }
+
+                // Copy beside the destination, then verify the staged app.
+                try fm.copyItem(at: candidate, to: incoming)
+
+                defer {
+                    if fm.fileExists(atPath: incoming.path) {
+                        try? fm.removeItem(at: incoming)
+                    }
+                }
+
+                let staged = try verify(incoming)
+
+                guard staged.0 == replacement.0,
+                      staged.1 == replacement.1 else {
+                    throw fail("Fresh installation staging verification failed.")
+                }
+
+                // Do not overwrite an installation that appeared meanwhile.
+                guard !fm.fileExists(atPath: installed.path),
+                      (try? fm.destinationOfSymbolicLink(
+                        atPath: installed.path
+                      )) == nil else {
+                    throw fail("Installation destination is no longer empty.")
+                }
+
+                try fm.moveItem(at: incoming, to: installed)
+
+                do {
+                    let checked = try verify(installed)
+
+                    guard checked.0 == replacement.0,
+                          checked.1 == replacement.1 else {
+                        throw fail("Installed application verification failed.")
+                    }
+                } catch {
+                    let installationError = error
+
+                    do {
+                        try fm.removeItem(at: installed)
+                    } catch {
+                        throw fail(
+                            "Installation verification failed, and cleanup also failed. " +
+                            error.localizedDescription
+                        )
+                    }
+
+                    throw fail(
+                        "Fresh installation failed; incomplete application removed. " +
+                        installationError.localizedDescription
+                    )
+                }
+
+                NSLog(
+                    "MacBox: Fresh 86Box installation completed: build %@",
+                    replacement.1
+                )
+
+                return replacement
+            }
+
+            // Existing installations continue through the tested
+            // backup, replacement and rollback routine.
+
+            let previous = try verify(installed)
+
+            // Only permit genuine upgrades to existing installations.
+            if isStableChannel {
+                let comparison = replacement.0.compare(
+                    previous.0,
+                    options: .numeric
+                )
+
+                guard comparison == .orderedDescending else {
+                    throw fail(
+                        "Stable version \(replacement.0) is not newer than " +
+                        "the installed version \(previous.0). " +
+                        "Downgrades and reinstalls are blocked."
+                    )
+                }
+            } else {
+                guard let newBuild = Int(replacement.1),
+                    let oldBuild = Int(previous.1),
+                    newBuild > oldBuild else {
+                    throw fail(
+                        "Experimental build \(replacement.1) is not newer " +
+                        "than the installed build \(previous.1)."
+                    )
+                }
             }
 
             // Prepare unique paths for this installation transaction.
