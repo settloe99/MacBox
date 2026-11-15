@@ -168,8 +168,12 @@ class MainViewController: NSViewController {
                 var eligibleFolder: URL?
                 var folderWasEmpty = false
 
-                if incomingNames.count == 1, parkedNames.isEmpty {
-                    let name = incomingNames[0]
+                // Review one staging directory per recovery operation.
+                // Sorting ensures the same directory is selected each time.
+                let orderedIncomingNames = incomingNames.sorted()
+
+                if parkedNames.isEmpty,
+                   let name = orderedIncomingNames.first {
                     let identifier = String(
                         name.dropFirst(incomingPrefix.count).dropLast(4)
                     )
@@ -201,14 +205,20 @@ class MainViewController: NSViewController {
                     let alert = NSAlert()
                     alert.alertStyle = .warning
                     alert.messageText = "Incomplete 86Box installation detected"
+                    let targetName = selectedFolder?.lastPathComponent
+                        ?? "Unavailable"
+
                     alert.informativeText = """
                     MacBox found \(incomingNames.count) unfinished staging item(s).
 
-                    The installed emulator has been preserved.
+                    Selected for review:
+                    \(targetName)
 
-                    Empty staging folders can be removed. Nonempty staging folders can be moved into recovery quarantine without deleting their contents.
+                    Only the selected folder will be processed. All other staging items will remain unchanged.
 
-                    Further updates remain blocked until the interruption is resolved.
+                    Empty folders can be removed. Nonempty folders can be moved into recovery quarantine without deleting their contents.
+
+                    Further updates remain blocked until all interrupted transactions are resolved.
                     """
 
                     if selectedFolder != nil {
@@ -260,9 +270,9 @@ class MainViewController: NSViewController {
                             $0.hasSuffix(".app")
                         }
 
-                        guard currentIncoming.count == 1,
-                              currentIncoming[0] == folder.lastPathComponent,
-                              currentParked.isEmpty else {
+                        guard currentIncoming.sorted() == orderedIncomingNames,
+                            currentIncoming.contains(folder.lastPathComponent),
+                            currentParked.isEmpty else {
                             throw recoveryError(
                                 "Transaction state changed. No cleanup performed."
                             )
