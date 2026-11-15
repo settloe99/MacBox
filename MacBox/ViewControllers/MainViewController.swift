@@ -164,120 +164,212 @@ class MainViewController: NSViewController {
             // Do not automatically delete it or alter the
             // installed emulator.
             if !incomingNames.isEmpty {
-                NSLog(
-                    "MacBoxReleaseTest: Unfinished incoming applications: %@",
-                    incomingNames.joined(separator: ", ")
-                )
+                let incomingPrefix = ".MacBox-86Box-incoming-"
+                var eligibleFolder: URL?
+                var folderWasEmpty = false
 
-                // Only allow simple cleanup when exactly one
-                // empty incoming directory exists and no
-                // previous application is parked.
-                var removableFolder: URL?
-
-                if incomingNames.count == 1,
-                   parkedNames.isEmpty,
-                   fm.fileExists(atPath: installed.path) {
-
+                if incomingNames.count == 1, parkedNames.isEmpty {
                     let name = incomingNames[0]
-                    let prefix = ".MacBox-86Box-incoming-"
-
                     let identifier = String(
-                        name.dropFirst(prefix.count).dropLast(4)
+                        name.dropFirst(incomingPrefix.count).dropLast(4)
                     )
-
                     let folder = root.appendingPathComponent(
-                        name,
-                        isDirectory: true
+                        name, isDirectory: true
                     )
 
                     if UUID(uuidString: identifier) != nil,
-                       folder.path ==
-                           folder.resolvingSymlinksInPath().path,
+                       folder.path == folder.resolvingSymlinksInPath().path,
                        let attributes = try? fm.attributesOfItem(
                            atPath: folder.path
                        ),
-                       attributes[.type] as? FileAttributeType ==
-                           .typeDirectory,
+                       attributes[.type] as? FileAttributeType == .typeDirectory,
                        let contents = try? fm.contentsOfDirectory(
                            atPath: folder.path
                        ),
-                       contents.isEmpty {
-                        removableFolder = folder
+                       installed.path == installed.resolvingSymlinksInPath().path,
+                       let bundle = Bundle(url: installed),
+                       bundle.bundleIdentifier == "net.86Box.86Box" {
+                        eligibleFolder = folder
+                        folderWasEmpty = contents.isEmpty
                     }
                 }
 
-                let safeFolder = removableFolder
+                let selectedFolder = eligibleFolder
+                let wasEmpty = folderWasEmpty
 
                 DispatchQueue.main.async {
                     let alert = NSAlert()
                     alert.alertStyle = .warning
-                    alert.messageText =
-                        "Incomplete 86Box installation detected"
-
+                    alert.messageText = "Incomplete 86Box installation detected"
                     alert.informativeText = """
-                    MacBox found \(incomingNames.count) unfinished 86Box installation item(s).
-
-                    This may have resulted from an interrupted update.
+                    MacBox found \(incomingNames.count) unfinished staging item(s).
 
                     The installed emulator has been preserved.
 
-                    Further updates are blocked until the incomplete transaction is resolved.
+                    Empty staging folders can be removed. Nonempty staging folders can be moved into recovery quarantine without deleting their contents.
+
+                    Further updates remain blocked until the interruption is resolved.
                     """
 
-                    if safeFolder != nil {
+                    if selectedFolder != nil {
                         alert.addButton(
-                            withTitle: "Remove empty staging folder"
+                            withTitle: wasEmpty
+                                ? "Remove empty staging folder"
+                                : "Move to recovery quarantine"
                         )
                     }
-
                     alert.addButton(withTitle: "Leave unchanged")
 
                     let response = alert.runModal()
 
                     guard response == .alertFirstButtonReturn,
-                          let folder = safeFolder else {
+                          let folder = selectedFolder else {
                         return
                     }
 
-                    do {
-                        // rmdir refuses to remove nonempty directories.
-                        // Unlike FileManager.removeItem, it cannot
-                        // recursively delete application contents.
-                        let process = Process()
-                        process.executableURL = URL(
-                            fileURLWithPath: "/bin/rmdir"
+                    func recoveryError(_ message: String) -> NSError {
+                        NSError(
+                            domain: "MacBoxReleaseTest.Recovery",
+                            code: 1,
+                            userInfo: [NSLocalizedDescriptionKey: message]
                         )
-                        process.arguments = [folder.path]
+                    }
 
-                        try process.run()
-                        process.waitUntilExit()
+                    do {
+                        guard root.path == root.resolvingSymlinksInPath().path,
+                              folder.path == folder.resolvingSymlinksInPath().path,
+                              let attributes = try? fm.attributesOfItem(
+                                atPath: folder.path
+                              ),
+                              attributes[.type] as? FileAttributeType == .typeDirectory,
+                              installed.path == installed.resolvingSymlinksInPath().path,
+                              let bundle = Bundle(url: installed),
+                              bundle.bundleIdentifier == "net.86Box.86Box" else {
+                            throw recoveryError("Filesystem safety check failed.")
+                        }
 
-                        guard process.terminationStatus == 0 else {
-                            throw NSError(
-                                domain: "MacBoxReleaseTest.Recovery",
-                                code: 1,
-                                userInfo: [
-                                    NSLocalizedDescriptionKey:
-                                        "The staging folder could not be removed. It may no longer be empty."
-                                ]
+                        let currentNames = try fm.contentsOfDirectory(
+                            atPath: root.path
+                        )
+
+                        let currentIncoming = currentNames.filter {
+                            $0.hasPrefix(incomingPrefix) && $0.hasSuffix(".app")
+                        }
+                        let currentParked = currentNames.filter {
+                            $0.hasPrefix(".MacBox-86Box-previous-") &&
+                            $0.hasSuffix(".app")
+                        }
+
+                        guard currentIncoming.count == 1,
+                              currentIncoming[0] == folder.lastPathComponent,
+                              currentParked.isEmpty else {
+                            throw recoveryError(
+                                "Transaction state changed. No cleanup performed."
                             )
                         }
 
-                        NSLog(
-                            "MacBoxReleaseTest: Removed empty staging folder: %@",
-                            folder.path
+                        let contents = try fm.contentsOfDirectory(
+                            atPath: folder.path
                         )
+
+                        guard contents.isEmpty == wasEmpty else {
+                            throw recoveryError(
+                                "Staging folder contents changed. No cleanup performed."
+                            )
+                        }
+
+                        let result: String
+
+                        if wasEmpty {
+                            let process = Process()
+                            process.executableURL = URL(
+                                fileURLWithPath: "/bin/rmdir"
+                            )
+                            process.arguments = [folder.path]
+
+                            try process.run()
+                            process.waitUntilExit()
+
+                            guard process.terminationStatus == 0 else {
+                                throw recoveryError(
+                                    "The empty staging folder could not be removed."
+                                )
+                            }
+
+                            result = "The empty staging folder was removed."
+                        } else {
+                            let quarantine = root.appendingPathComponent(
+                                "86Box-recovery-quarantine",
+                                isDirectory: true
+                            )
+
+                            if !fm.fileExists(atPath: quarantine.path) {
+                                guard (try? fm.destinationOfSymbolicLink(
+                                    atPath: quarantine.path
+                                )) == nil else {
+                                    throw recoveryError(
+                                        "Quarantine destination is a symbolic link."
+                                    )
+                                }
+                                try fm.createDirectory(
+                                    at: quarantine,
+                                    withIntermediateDirectories: false
+                                )
+                            }
+
+                            guard quarantine.path ==
+                                    quarantine.resolvingSymlinksInPath().path,
+                                  let quarantineAttributes =
+                                    try? fm.attributesOfItem(
+                                        atPath: quarantine.path
+                                    ),
+                                  quarantineAttributes[.type] as?
+                                    FileAttributeType == .typeDirectory else {
+                                throw recoveryError(
+                                    "Quarantine directory is unsafe."
+                                )
+                            }
+
+                            let destination = quarantine.appendingPathComponent(
+                                folder.lastPathComponent,
+                                isDirectory: true
+                            )
+
+                            guard !fm.fileExists(atPath: destination.path),
+                                  (try? fm.destinationOfSymbolicLink(
+                                    atPath: destination.path
+                                  )) == nil else {
+                                throw recoveryError(
+                                    "A quarantine item already exists at that path."
+                                )
+                            }
+
+                            try fm.moveItem(at: folder, to: destination)
+
+                            guard fm.fileExists(atPath: destination.path),
+                                  !fm.fileExists(atPath: folder.path) else {
+                                throw recoveryError(
+                                    "Quarantine move requires manual verification."
+                                )
+                            }
+
+                            result = """
+                            The staging folder was moved into recovery quarantine.
+
+                            Its contents have been preserved at:
+
+                            \(destination.path)
+                            """
+                        }
 
                         let success = NSAlert()
                         success.alertStyle = .informational
-                        success.messageText =
-                            "Incomplete installation resolved"
-                        success.informativeText = """
-                        The empty staging folder has been removed.
+                        success.messageText = "Staging recovery completed"
+                        success.informativeText = result + """
 
-                        Your installed 86Box application has not been modified.
 
-                        Future updates are no longer blocked by this staging folder.
+
+                        The installed emulator was not modified.
                         """
                         success.addButton(withTitle: "OK")
                         success.runModal()
@@ -285,10 +377,8 @@ class MainViewController: NSViewController {
                     } catch {
                         let failure = NSAlert()
                         failure.alertStyle = .warning
-                        failure.messageText =
-                            "Staging cleanup failed"
-                        failure.informativeText =
-                            error.localizedDescription
+                        failure.messageText = "Staging recovery failed"
+                        failure.informativeText = error.localizedDescription
                         failure.addButton(withTitle: "OK")
                         failure.runModal()
                     }
