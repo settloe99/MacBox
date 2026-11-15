@@ -155,6 +155,148 @@ class MainViewController: NSViewController {
                 $0.hasPrefix(prefix) && $0.hasSuffix(".app")
             }
 
+            let incomingNames = names.filter {
+                $0.hasPrefix(".MacBox-86Box-incoming-") &&
+                $0.hasSuffix(".app")
+            }
+
+            // An unfinished incoming application needs review.
+            // Do not automatically delete it or alter the
+            // installed emulator.
+            if !incomingNames.isEmpty {
+                NSLog(
+                    "MacBoxReleaseTest: Unfinished incoming applications: %@",
+                    incomingNames.joined(separator: ", ")
+                )
+
+                // Only allow simple cleanup when exactly one
+                // empty incoming directory exists and no
+                // previous application is parked.
+                var removableFolder: URL?
+
+                if incomingNames.count == 1,
+                   parkedNames.isEmpty,
+                   fm.fileExists(atPath: installed.path) {
+
+                    let name = incomingNames[0]
+                    let prefix = ".MacBox-86Box-incoming-"
+
+                    let identifier = String(
+                        name.dropFirst(prefix.count).dropLast(4)
+                    )
+
+                    let folder = root.appendingPathComponent(
+                        name,
+                        isDirectory: true
+                    )
+
+                    if UUID(uuidString: identifier) != nil,
+                       folder.path ==
+                           folder.resolvingSymlinksInPath().path,
+                       let attributes = try? fm.attributesOfItem(
+                           atPath: folder.path
+                       ),
+                       attributes[.type] as? FileAttributeType ==
+                           .typeDirectory,
+                       let contents = try? fm.contentsOfDirectory(
+                           atPath: folder.path
+                       ),
+                       contents.isEmpty {
+                        removableFolder = folder
+                    }
+                }
+
+                let safeFolder = removableFolder
+
+                DispatchQueue.main.async {
+                    let alert = NSAlert()
+                    alert.alertStyle = .warning
+                    alert.messageText =
+                        "Incomplete 86Box installation detected"
+
+                    alert.informativeText = """
+                    MacBox found \(incomingNames.count) unfinished 86Box installation item(s).
+
+                    This may have resulted from an interrupted update.
+
+                    The installed emulator has been preserved.
+
+                    Further updates are blocked until the incomplete transaction is resolved.
+                    """
+
+                    if safeFolder != nil {
+                        alert.addButton(
+                            withTitle: "Remove empty staging folder"
+                        )
+                    }
+
+                    alert.addButton(withTitle: "Leave unchanged")
+
+                    let response = alert.runModal()
+
+                    guard response == .alertFirstButtonReturn,
+                          let folder = safeFolder else {
+                        return
+                    }
+
+                    do {
+                        // rmdir refuses to remove nonempty directories.
+                        // Unlike FileManager.removeItem, it cannot
+                        // recursively delete application contents.
+                        let process = Process()
+                        process.executableURL = URL(
+                            fileURLWithPath: "/bin/rmdir"
+                        )
+                        process.arguments = [folder.path]
+
+                        try process.run()
+                        process.waitUntilExit()
+
+                        guard process.terminationStatus == 0 else {
+                            throw NSError(
+                                domain: "MacBoxReleaseTest.Recovery",
+                                code: 1,
+                                userInfo: [
+                                    NSLocalizedDescriptionKey:
+                                        "The staging folder could not be removed. It may no longer be empty."
+                                ]
+                            )
+                        }
+
+                        NSLog(
+                            "MacBoxReleaseTest: Removed empty staging folder: %@",
+                            folder.path
+                        )
+
+                        let success = NSAlert()
+                        success.alertStyle = .informational
+                        success.messageText =
+                            "Incomplete installation resolved"
+                        success.informativeText = """
+                        The empty staging folder has been removed.
+
+                        Your installed 86Box application has not been modified.
+
+                        Future updates are no longer blocked by this staging folder.
+                        """
+                        success.addButton(withTitle: "OK")
+                        success.runModal()
+
+                    } catch {
+                        let failure = NSAlert()
+                        failure.alertStyle = .warning
+                        failure.messageText =
+                            "Staging cleanup failed"
+                        failure.informativeText =
+                            error.localizedDescription
+                        failure.addButton(withTitle: "OK")
+                        failure.runModal()
+                    }
+                }
+
+                return
+            }
+
             guard !parkedNames.isEmpty else { return }
 
             // Check whether the installed application exists after
