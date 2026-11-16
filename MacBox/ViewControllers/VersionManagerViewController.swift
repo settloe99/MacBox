@@ -1051,6 +1051,10 @@ class VersionManagerViewController: NSViewController {
                 )
             }
 
+            // Park the verified original before installing its replacement.
+            // If parking fails, abort without touching the installed app.
+            try fm.moveItem(at: installed, to: parked)
+
             do {
                 // Install the staged replacement using a local move.
                 try fm.moveItem(at: incoming, to: installed)
@@ -1066,12 +1070,43 @@ class VersionManagerViewController: NSViewController {
                 let installationError = error
 
                 do {
-                    if fm.fileExists(atPath: installed.path) {
+                    // Never remove a destination unless the parked
+                    // original is present and verified.
+                    let parkedCheck = try verify(parked)
+
+                    guard parkedCheck.0 == previous.0,
+                          parkedCheck.1 == previous.1 else {
+                        throw fail(
+                            "The parked original is missing or does " +
+                            "not match the expected version. " +
+                            "No installation files were removed."
+                        )
+                    }
+
+                    let destinationOccupied =
+                        fm.fileExists(atPath: installed.path) ||
+                        (try? fm.destinationOfSymbolicLink(
+                            atPath: installed.path
+                        )) != nil
+
+                    if destinationOccupied {
+                        // Only discard a verified replacement belonging
+                        // to this transaction. Preserve any unknown or
+                        // damaged application for manual recovery.
+                        guard let current = try? verify(installed),
+                              current.0 == replacement.0,
+                              current.1 == replacement.1 else {
+                            throw fail(
+                                "An unknown or damaged application " +
+                                "occupies the installation destination. " +
+                                "Files have been preserved for manual recovery."
+                            )
+                        }
+
                         try fm.removeItem(at: installed)
                     }
 
                     try fm.moveItem(at: parked, to: installed)
-
                     let restored = try verify(installed)
                     guard restored.0 == previous.0,
                           restored.1 == previous.1 else {
