@@ -763,11 +763,27 @@ class VersionManagerViewController: NSViewController {
             }
 
             let hasExistingInstallation: Bool
-
             if fm.fileExists(atPath: installed.path) {
                 try requireRealDirectory(installed)
+
+                // Never treat a damaged existing application as
+                // a normal update candidate.
+                do {
+                    _ = try verify(installed)
+                } catch {
+                    throw fail(
+                        "The existing 86Box installation failed " +
+                        "integrity verification. The update has been " +
+                        "blocked without modifying the emulator. " +
+                        "Use the recovery process rather than a " +
+                        "normal update. Details: " +
+                        error.localizedDescription
+                    )
+                }
+
                 hasExistingInstallation = true
             } else {
+
                 // Reject even a dangling symbolic link at the destination.
                 guard (try? fm.destinationOfSymbolicLink(
                     atPath: installed.path
@@ -1011,8 +1027,29 @@ class VersionManagerViewController: NSViewController {
                 )
             }
 
-            // Move the original aside on its own filesystem.
-            try fm.moveItem(at: installed, to: parked)
+            // Reverify the existing application immediately before
+            // moving it. Abort if it has become damaged or its
+            // version has changed during preparation.
+            let beforeMove: (String, String)
+
+            do {
+                beforeMove = try verify(installed)
+            } catch {
+                throw fail(
+                    "The existing emulator failed its final " +
+                    "integrity check. Installation cancelled " +
+                    "before replacement. Details: " +
+                    error.localizedDescription
+                )
+            }
+
+            guard beforeMove.0 == previous.0,
+                  beforeMove.1 == previous.1 else {
+                throw fail(
+                    "The installed emulator version changed during " +
+                    "update preparation. Installation cancelled."
+                )
+            }
 
             do {
                 // Install the staged replacement using a local move.

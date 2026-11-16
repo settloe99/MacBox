@@ -397,7 +397,99 @@ class MainViewController: NSViewController {
                 return
             }
 
-            guard !parkedNames.isEmpty else { return }
+            // Also check the installed application when there is no
+            // interrupted transaction to recover.
+            if parkedNames.isEmpty {
+                let installedExists =
+                    fm.fileExists(atPath: installed.path) ||
+                    (try? fm.destinationOfSymbolicLink(
+                        atPath: installed.path
+                    )) != nil
+
+                if installedExists {
+                    func installedIsValid() -> Bool {
+                        guard installed.path ==
+                                installed.resolvingSymlinksInPath().path,
+                              let attributes = try? fm.attributesOfItem(
+                                atPath: installed.path
+                              ),
+                              attributes[.type] as? FileAttributeType ==
+                                .typeDirectory,
+                              let bundle = Bundle(url: installed),
+                              bundle.bundleIdentifier == "net.86Box.86Box",
+                              let version = bundle.infoDictionary?[
+                                "CFBundleVersion"
+                              ] as? String,
+                              !version.isEmpty else {
+                            return false
+                        }
+
+                        let executable = installed.appendingPathComponent(
+                            "Contents/MacOS/86Box"
+                        )
+
+                        for (tool, arguments) in [
+                            (
+                                "/usr/bin/codesign",
+                                ["--verify", "--deep", "--strict", installed.path]
+                            ),
+                            (
+                                "/usr/bin/lipo",
+                                ["-verify_arch", "arm64", executable.path]
+                            )
+                        ] {
+                            let process = Process()
+                            process.executableURL = URL(
+                                fileURLWithPath: tool
+                            )
+                            process.arguments = arguments
+
+                            do {
+                                try process.run()
+                                process.waitUntilExit()
+
+                                guard process.terminationStatus == 0 else {
+                                    return false
+                                }
+                            } catch {
+                                return false
+                            }
+                        }
+
+                        return true
+                    }
+
+                    if !installedIsValid() {
+                        NSLog(
+                            "MacBoxReleaseTest: Installed 86Box failed verification."
+                        )
+
+                        DispatchQueue.main.async {
+                            let alert = NSAlert()
+                            alert.alertStyle = .critical
+                            alert.messageText =
+                                "Installed 86Box application is damaged"
+
+                            alert.informativeText = """
+                            The installed 86Box application failed integrity or compatibility verification.
+
+                            \(installed.path)
+
+                            No previous application is parked for automatic recovery.
+
+                            MacBox has not modified or removed any files.
+
+                            Do not launch or update this emulator until its installation has been reviewed.
+                            """
+
+                            alert.addButton(withTitle: "Leave unchanged")
+                            alert.runModal()
+                        }
+                    }
+                }
+
+                return
+            }
 
             // Check whether the installed application exists after
             // validating the parked previous version below.
