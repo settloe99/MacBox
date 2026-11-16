@@ -457,9 +457,186 @@ class MainViewController: NSViewController {
                 return version
             }
 
-
             guard let originalVersion = verifiedVersion(parked) else {
                 NSLog("MacBoxReleaseTest: Parked emulator verification failed.")
+
+                let expectedInstalledVersion = verifiedVersion(installed)
+
+                DispatchQueue.main.async {
+                    let alert = NSAlert()
+                    alert.alertStyle = .warning
+                    alert.messageText =
+                        "Damaged previous 86Box installation detected"
+
+                    let installedStatus = expectedInstalledVersion != nil
+                        ? "The installed emulator passed verification."
+                        : "The installed emulator is missing or could not be verified."
+
+                    alert.informativeText = """
+                    An interrupted update left a previous 86Box application that failed verification.
+
+                    \(parked.path)
+
+                    \(installedStatus)
+
+                    The damaged application will not be restored or deleted automatically.
+
+                    If the installed emulator is valid, the damaged copy can be moved to recovery quarantine.
+
+                    Updates remain blocked until this interrupted transaction is resolved.
+                    """
+
+                    if expectedInstalledVersion != nil {
+                        alert.addButton(
+                            withTitle: "Move damaged copy to quarantine"
+                        )
+                    }
+                    alert.addButton(withTitle: "Leave unchanged")
+
+                    let response = alert.runModal()
+
+                    guard response == .alertFirstButtonReturn,
+                          let expectedVersion = expectedInstalledVersion else {
+                        return
+                    }
+
+                    func recoveryError(_ message: String) -> NSError {
+                        NSError(
+                            domain: "MacBoxReleaseTest.Recovery",
+                            code: 1,
+                            userInfo: [
+                                NSLocalizedDescriptionKey: message
+                            ]
+                        )
+                    }
+
+                    do {
+                        // Recheck both applications and the transaction
+                        // state before moving any files.
+                        guard root.path ==
+                                root.resolvingSymlinksInPath().path,
+                              parked.path ==
+                                parked.resolvingSymlinksInPath().path,
+                              let attributes = try? fm.attributesOfItem(
+                                atPath: parked.path
+                              ),
+                              attributes[.type] as? FileAttributeType ==
+                                .typeDirectory,
+                              verifiedVersion(installed) == expectedVersion,
+                              verifiedVersion(parked) == nil else {
+                            throw recoveryError(
+                                "Application verification or filesystem state changed."
+                            )
+                        }
+
+                        let currentNames = try fm.contentsOfDirectory(
+                            atPath: root.path
+                        )
+
+                        let currentParked = currentNames.filter {
+                            $0.hasPrefix(prefix) && $0.hasSuffix(".app")
+                        }
+                        let currentIncoming = currentNames.filter {
+                            $0.hasPrefix(".MacBox-86Box-incoming-") &&
+                            $0.hasSuffix(".app")
+                        }
+
+                        guard currentParked == [name],
+                              currentIncoming.isEmpty else {
+                            throw recoveryError(
+                                "Transaction state changed. No recovery performed."
+                            )
+                        }
+
+                        let quarantine = root.appendingPathComponent(
+                            "86Box-recovery-quarantine",
+                            isDirectory: true
+                        )
+
+                        // The quarantine must be an ordinary directory,
+                        // never a symbolic link.
+                        if !fm.fileExists(atPath: quarantine.path) {
+                            guard (try? fm.destinationOfSymbolicLink(
+                                atPath: quarantine.path
+                            )) == nil else {
+                                throw recoveryError(
+                                    "Quarantine path is a symbolic link."
+                                )
+                            }
+                            try fm.createDirectory(
+                                at: quarantine,
+                                withIntermediateDirectories: false
+                            )
+                        }
+
+                        guard quarantine.path ==
+                                quarantine.resolvingSymlinksInPath().path,
+                              let quarantineAttributes =
+                                try? fm.attributesOfItem(
+                                    atPath: quarantine.path
+                                ),
+                              quarantineAttributes[.type] as?
+                                FileAttributeType == .typeDirectory else {
+                            throw recoveryError(
+                                "Quarantine directory is unsafe."
+                            )
+                        }
+
+                        let destination = quarantine.appendingPathComponent(
+                            name,
+                            isDirectory: true
+                        )
+
+                        guard !fm.fileExists(atPath: destination.path),
+                              (try? fm.destinationOfSymbolicLink(
+                                atPath: destination.path
+                              )) == nil else {
+                            throw recoveryError(
+                                "A quarantine item already exists at this path."
+                            )
+                        }
+
+                        // Move, never recursively delete.
+                        try fm.moveItem(at: parked, to: destination)
+
+                        guard fm.fileExists(atPath: destination.path),
+                              !fm.fileExists(atPath: parked.path) else {
+                            throw recoveryError(
+                                "The move requires manual verification."
+                            )
+                        }
+
+                        let success = NSAlert()
+                        success.alertStyle = .informational
+                        success.messageText =
+                            "Damaged 86Box application quarantined"
+                        success.informativeText = """
+                        The damaged previous emulator has been moved to:
+
+                        \(destination.path)
+
+                        Its contents have been preserved.
+
+                        The installed emulator was not modified.
+                        """
+                        success.addButton(withTitle: "OK")
+                        success.runModal()
+
+                    } catch {
+                        let failure = NSAlert()
+                        failure.alertStyle = .warning
+                        failure.messageText =
+                            "Recovery could not be completed"
+                        failure.informativeText = """
+                        \(error.localizedDescription)
+
+                        Review the recovery directories before trying again.
+                        """
+                        failure.addButton(withTitle: "OK")
+                        failure.runModal()
+                    }
+                }
+
                 return
             }
 
