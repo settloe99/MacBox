@@ -79,6 +79,7 @@ class VersionManagerViewController: NSViewController {
 
         // Config views
         configView()
+
     }
 
     // View will appear
@@ -654,7 +655,9 @@ class VersionManagerViewController: NSViewController {
                 throw fail("Invalid 86Box installation destination.")
             }
 
+
             #if MACBOX_RELEASE_TEST
+
             let testDestination = fm.homeDirectoryForCurrentUser
                 .appendingPathComponent("MacBox-ReleaseTest/86Box.app")
                 .standardizedFileURL
@@ -694,51 +697,33 @@ class VersionManagerViewController: NSViewController {
                 try requireRealDirectory(url)
             }
 
-            // Validate metadata, Apple Silicon compatibility and signature.
+            // Use the shared verifier for application identity,
+            // signature, architecture and version validation.
             func verify(_ app: URL) throws -> (String, String) {
-                try requireRealDirectory(app)
-
-                let plistURL = app.appendingPathComponent(
-                    "Contents/Info.plist"
-                )
-                let data = try Data(contentsOf: plistURL)
-                guard let info = try PropertyListSerialization.propertyList(
-                    from: data, format: nil
-                ) as? [String: Any],
-                    info["CFBundleIdentifier"] as? String == "net.86Box.86Box",
-                    let version = info["CFBundleShortVersionString"] as? String,
-                    let fullBuild = info["CFBundleVersion"] as? String,
-                    let build = fullBuild.split(separator: ".").last
-                else {
-                    throw fail("Invalid 86Box application metadata.")
-                }
-
-                let executable = app.appendingPathComponent(
-                    "Contents/MacOS/86Box"
-                )
-
-                for (tool, arguments) in [
-                    ("/usr/bin/codesign", ["--verify", app.path]),
-                    ("/usr/bin/lipo", [
-                        "-verify_arch", "arm64", executable.path
-                    ])
-                ] {
-                    let process = Process()
-                    process.executableURL = URL(fileURLWithPath: tool)
-                    process.arguments = arguments
-                    try process.run()
-                    process.waitUntilExit()
-
-                    guard process.terminationStatus == 0 else {
-                        throw fail("Verification failed: \(tool)")
-                    }
-                }
-
-                return (version, String(build))
+                let verified = try EmulatorIntegrity.verify(app)
+                return (verified.version, verified.build)
             }
 
             // Never trust an application preference for this destination.
             try requireRealDirectory(root)
+
+            // Record the exact managed destination before any
+            // installation files are moved. Startup recovery must
+            // still find this directory if 86Box.app is missing.
+            #if !DEBUG
+            let recoveryDefaults = UserDefaults.standard
+            recoveryDefaults.set(
+                installed.path,
+                forKey: "MacBoxManaged86BoxPath"
+            )
+
+            guard recoveryDefaults.synchronize() else {
+                throw fail(
+                    "Unable to save the 86Box recovery destination. " +
+                    "Installation cancelled before replacement."
+                )
+            }
+            #endif
 
             // Detect incomplete transactions from a previous update.
             // Do not start another installation until recovery is complete.
@@ -1065,6 +1050,7 @@ class VersionManagerViewController: NSViewController {
                       checked.1 == replacement.1 else {
                     throw fail("Installed version verification failed.")
                 }
+
 
             } catch {
                 let installationError = error
