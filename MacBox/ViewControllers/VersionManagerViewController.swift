@@ -6,6 +6,7 @@
 //
 
 import Cocoa
+import CommonCrypto
 import ZIPFoundation
 
 class VersionManagerViewController: NSViewController {
@@ -79,7 +80,6 @@ class VersionManagerViewController: NSViewController {
 
         // Config views
         configView()
-
     }
 
     // View will appear
@@ -271,7 +271,12 @@ class VersionManagerViewController: NSViewController {
                 ) ? "Update" : "Install"
 
                 emulatorUpdateButton.isEnabled = updaterPermitted(.emulator)
-                romsUpdateButton.isEnabled = false
+
+                // Enable ROM installation in the isolated Release-Test laboratory.
+                // The button action and managedRomsDestination() enforce the
+                // laboratory destination before installation can begin.
+                romsUpdateButton.isEnabled = true
+
                 macboxUpdateButton.isEnabled = false
 
                 #elseif DEBUG
@@ -342,29 +347,55 @@ class VersionManagerViewController: NSViewController {
         romsUpdateDateTextField.toolTip = formattedDate
     }
 
-    // Populate MacBox update info
+    // Populate MacBox update information
     private func populateMacBoxUpdateInfo() {
+
         let versionInfoObject = MainViewController.instance.versionInfoObject
 
-        dateFormatter.dateFormat = dateInputFormatString
-        let date: Date? = dateFormatter.date(from: versionInfoObject.macboxUpdateObject?.published_at ?? "")
-        let formattedDate = date?.getFormattedDate(format: dateOutputFormatString)
+        // No published release was returned by the update feed.
+        guard let release = versionInfoObject.macboxUpdateObject else {
+            macboxUpdateDateTextField.stringValue = "Release unavailable"
+            macboxUpdateDateTextField.toolTip =
+                "No release information was returned by GitHub."
 
-        var relativeDate = ""
-        if #available(macOS 10.15, *) {
-            let relativeDateFormatter = RelativeDateTimeFormatter()
-            relativeDateFormatter.unitsStyle = .full
+            macboxReleaseNoteTextView.string = """
+            No published MacBox release is currently available
+            from settloe99/MacBox.
+            """
 
-            relativeDate = relativeDateFormatter.localizedString(for: date ?? Date(), relativeTo: Date())
-        } else {
-            // Fallback on earlier versions
-            relativeDate = formattedDate ?? "-"
+            return
         }
 
-        macboxUpdateDateTextField.stringValue = relativeDate
-        macboxUpdateDateTextField.toolTip = formattedDate
+        dateFormatter.dateFormat = dateInputFormatString
 
-        macboxReleaseNoteTextView.string = versionInfoObject.macboxUpdateObject?.body ?? "-"
+        if let publishedAt = release.published_at,
+           let date = dateFormatter.date(from: publishedAt) {
+
+            let formattedDate = date.getFormattedDate(
+                format: dateOutputFormatString
+            )
+
+            if #available(macOS 10.15, *) {
+                let relativeDateFormatter = RelativeDateTimeFormatter()
+                relativeDateFormatter.unitsStyle = .full
+
+                macboxUpdateDateTextField.stringValue =
+                    relativeDateFormatter.localizedString(
+                        for: date,
+                        relativeTo: Date()
+                    )
+            } else {
+                macboxUpdateDateTextField.stringValue = formattedDate
+            }
+
+            macboxUpdateDateTextField.toolTip = formattedDate
+
+        } else {
+            macboxUpdateDateTextField.stringValue = "Date unavailable"
+            macboxUpdateDateTextField.toolTip = nil
+        }
+
+        macboxReleaseNoteTextView.string = release.body ?? "-"
     }
 
     // Set update buttons visibility
@@ -401,40 +432,81 @@ class VersionManagerViewController: NSViewController {
             }
         }
 
-        // Set button label if 86Box is not installed
-        if versionInfoObject.emulatorAutoUrl == nil && versionInfoObject.emulatorCustomUrl == nil {
-            emulatorUpdateButton.title = NSLocalizedString("Install", comment: "")
-        }
-        else {
-            emulatorUpdateButton.title = NSLocalizedString("Update", comment: "")
+        // Set ROM button label based on installation state.
+        #if MACBOX_RELEASE_TEST
+        let romsInstalled: Bool
+
+        if let destination = try? managedRomsDestination() {
+            let machines = destination.appendingPathComponent(
+                "machines",
+                isDirectory: true
+            )
+
+            var isDirectory: ObjCBool = false
+
+            romsInstalled = FileManager.default.fileExists(
+                atPath: machines.path,
+                isDirectory: &isDirectory
+            ) && isDirectory.boolValue
+        } else {
+            romsInstalled = false
         }
 
-        // Compare 86Box ROMs version
-        if let romsShaVersion = versionInfoObject.romsUpdateObject?.sha {
-            if let localShaVersion = userDefaults.string(forKey: "romsShaVersion") {
-                if localShaVersion == String(romsShaVersion) && !versionInfoObject.romsUrls.isEmpty {
-                    romsUpdateButton.isHidden = true
-                    romsUpdateCheckImageView.isHidden = false
-                }
-            }
-        }
+        romsUpdateButton.title = romsInstalled
+            ? NSLocalizedString("Update", comment: "")
+            : NSLocalizedString("Install", comment: "")
 
-        // Set button label if 86Box ROMs are not installed
+        #else
         if versionInfoObject.romsUrls.isEmpty {
             romsUpdateButton.title = NSLocalizedString("Install", comment: "")
-        }
-        else {
+        } else {
             romsUpdateButton.title = NSLocalizedString("Update", comment: "")
         }
+        #endif
 
-        // Compare MacBox version
-        if let macboxOnlineVersion = versionInfoObject.macboxUpdateObject?.tag_name {
-            let localBuildVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? String(macboxOnlineVersion)
+        // Compare the installed ROM revision with the latest
+        // revision reported by GitHub.
+        if let remoteSha = versionInfoObject.romsUpdateObject?.sha,
+           let localSha = userDefaults.string(forKey: "romsShaVersion"),
+           localSha == String(remoteSha) {
 
-            if localBuildVersion == String(macboxOnlineVersion) {
+            #if MACBOX_RELEASE_TEST
+            // Release-Test uses the isolated ROM laboratory.
+            let installedRomsAvailable = romsInstalled
+            #else
+            // Preserve the original production ROM discovery.
+            let installedRomsAvailable = !versionInfoObject.romsUrls.isEmpty
+            #endif
+
+            if installedRomsAvailable {
+                romsUpdateButton.isHidden = true
+                romsUpdateCheckImageView.isHidden = false
+            }
+        }
+
+        // Compare MacBox version only when a release exists.
+        if let onlineVersion = versionInfoObject.macboxUpdateObject?.tag_name,
+           !onlineVersion.isEmpty {
+
+            let installedVersion = Bundle.main.object(
+                forInfoDictionaryKey: "CFBundleShortVersionString"
+            ) as? String
+
+            if installedVersion == onlineVersion {
+                // Installed version matches the published release.
                 macboxUpdateButton.isHidden = true
                 macboxUpdateCheckImageView.isHidden = false
+            } else {
+                // A different published release is available.
+                macboxUpdateButton.isHidden = false
+                macboxUpdateCheckImageView.isHidden = true
             }
+
+        } else {
+            // No valid release information.
+            // Neither an Update button nor a green tick is appropriate.
+            macboxUpdateButton.isHidden = true
+            macboxUpdateCheckImageView.isHidden = true
         }
     }
 
@@ -1144,11 +1216,160 @@ class VersionManagerViewController: NSViewController {
 
         }
 
-    // Fetch 86Box ROMs file
-    private func fetchRomsUpdateFile() {
-        if let url = URL(string: "https://api.github.com/repos/86Box/roms/zipball/master") {
-            downloadRomsFile(url: url)
+    // Select one managed, per-user ROM installation destination.
+    // Never use discovered VM-specific or system-wide ROM folders.
+    private func managedRomsDestination() throws -> URL {
+        let fm = FileManager.default
+
+        #if MACBOX_RELEASE_TEST
+        // ROM installation tests must never target the user's
+        // actual 86Box ROM collection.
+        let testRoot = fm.homeDirectoryForCurrentUser
+            .appendingPathComponent(
+                "MacBox-ReleaseTest",
+                isDirectory: true
+            ).standardizedFileURL
+
+        let lab = testRoot.appendingPathComponent(
+            "ROMs-Lab",
+            isDirectory: true
+        )
+
+        guard testRoot.path ==
+                testRoot.resolvingSymlinksInPath().path,
+              lab.path == lab.resolvingSymlinksInPath().path,
+              let attributes = try? fm.attributesOfItem(
+                atPath: lab.path
+              ),
+              attributes[.type] as? FileAttributeType ==
+                .typeDirectory else {
+            throw NSError(
+                domain: "MacBox.ROMUpdater",
+                code: 1,
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "The isolated ROM test directory is missing or unsafe."
+                ]
+            )
         }
+
+        return lab.appendingPathComponent(
+            "roms",
+            isDirectory: true
+        )
+        #else
+
+        guard let support = fm.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first?.standardizedFileURL else {
+            throw NSError(
+                domain: "MacBox.ROMUpdater",
+                code: 1,
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "User Application Support directory unavailable."
+                ]
+            )
+        }
+
+        func fail(_ message: String) -> NSError {
+            NSError(
+                domain: "MacBox.ROMUpdater",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: message]
+            )
+        }
+
+        let modern = support.appendingPathComponent(
+            "86Box/roms",
+            isDirectory: true
+        )
+
+        let legacy = support.appendingPathComponent(
+            "net.86box.86Box/roms",
+            isDirectory: true
+        )
+
+        func directoryExistsSafely(_ url: URL) throws -> Bool {
+            guard url.path == url.resolvingSymlinksInPath().path,
+                  (try? fm.destinationOfSymbolicLink(
+                    atPath: url.path
+                  )) == nil else {
+                throw fail("Unsafe ROM directory path: \(url.path)")
+            }
+
+            guard fm.fileExists(atPath: url.path) else {
+                return false
+            }
+
+            guard let attributes = try? fm.attributesOfItem(
+                atPath: url.path
+            ),
+                  attributes[.type] as? FileAttributeType ==
+                    .typeDirectory else {
+                throw fail("ROM path is not a directory: \(url.path)")
+            }
+
+            return true
+        }
+
+        let modernExists = try directoryExistsSafely(modern)
+        let legacyExists = try directoryExistsSafely(legacy)
+
+        guard !(modernExists && legacyExists) else {
+            throw fail(
+                "Both modern and legacy ROM directories exist. " +
+                "Choose which collection MacBox should manage " +
+                "before installing updates."
+            )
+        }
+
+        if modernExists {
+            return modern
+        }
+
+        if legacyExists {
+            return legacy
+        }
+
+        // Fresh installations use the current per-user location.
+        // This function only selects a path; it creates nothing.
+        return modern
+        #endif
+    }
+
+    // Download the exact ROM revision identified by the update check.
+    private func fetchRomsUpdateFile() {
+        guard let sha = MainViewController.instance
+                .versionInfoObject.romsUpdateObject?.sha,
+              sha.range(
+                of: "^[0-9a-fA-F]{40}$",
+                options: .regularExpression
+              ) != nil,
+              let url = URL(
+                string: "https://api.github.com/repos/86Box/roms/zipball/\(sha)"
+              ) else {
+
+            romsUpdateProgressIndicator.isHidden = true
+            romsUpdateButton.isHidden = false
+
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "ROM update information unavailable"
+            alert.informativeText = """
+            MacBox could not identify a valid ROM revision.
+
+            No ROM files have been downloaded or modified.
+
+            Check for updates again before retrying.
+            """
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+            return
+        }
+
+        downloadRomsFile(url: url)
     }
 
     // Download 86Box ROMs file
@@ -1171,107 +1392,583 @@ class VersionManagerViewController: NSViewController {
         downloadTask.resume()
     }
 
-    // Update 86Box ROMs with the new version
+
+    // Validate and install one ROM collection transactionally.
+    private func installRomsTransaction(downloadedFile: URL) throws {
+        let fm = FileManager.default
+
+        func fail(_ message: String) -> NSError {
+            NSError(
+                domain: "MacBox.ROMUpdater",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: message]
+            )
+        }
+
+        // A real destination is selected by our isolated/production
+        // selector, never by the list of discovered ROM folders.
+        let destination = try managedRomsDestination()
+            .standardizedFileURL
+        let parent = destination.deletingLastPathComponent()
+
+        guard destination.lastPathComponent == "roms",
+              destination.path != parent.path,
+              destination.path ==
+                destination.resolvingSymlinksInPath().path else {
+            throw fail("Unsafe ROM destination.")
+        }
+
+        // Inspect the ZIP before extracting any contents.
+        guard let archive = try? Archive(
+            url: downloadedFile,
+            accessMode: .read
+        ) else {
+            throw fail("The ROM download is not a valid ZIP archive.")
+        }
+
+        var rootName: String?
+        var seen = Set<String>()
+        var entryCount = 0
+        var totalSize: UInt64 = 0
+        var containsMachineROM = false
+
+        let maxExpandedSize: UInt64 = 4 * 1024 * 1024 * 1024
+
+        for entry in archive {
+            entryCount += 1
+
+            guard entryCount <= 50_000,
+                  entry.type != .symlink else {
+                throw fail("The ROM archive contains unsafe entries.")
+            }
+
+            let path = entry.path
+
+            guard !path.hasPrefix("/"),
+                  !path.contains("\\"),
+                  !path.contains("\0") else {
+                throw fail("Unsafe ROM archive filename.")
+            }
+
+            let trimmed = path.hasSuffix("/")
+                ? String(path.dropLast()) : path
+
+            let components = trimmed.split(
+                separator: "/",
+                omittingEmptySubsequences: false
+            )
+
+            guard !components.isEmpty,
+                  components.allSatisfy({
+                      !$0.isEmpty && $0 != "." && $0 != ".."
+                  }) else {
+                throw fail("Invalid ROM archive path.")
+            }
+
+            let root = String(components[0])
+
+            guard root.hasPrefix("86Box-roms-") else {
+                throw fail("Unexpected ROM archive structure.")
+            }
+
+            if let expectedRoot = rootName {
+                guard root == expectedRoot else {
+                    throw fail("Multiple archive roots detected.")
+                }
+            } else {
+                rootName = root
+            }
+
+            let key = trimmed.precomposedStringWithCanonicalMapping
+                .lowercased()
+
+            guard seen.insert(key).inserted else {
+                throw fail("Duplicate ROM archive entry.")
+            }
+
+            guard entry.uncompressedSize <= maxExpandedSize,
+                  totalSize <=
+                    maxExpandedSize - entry.uncompressedSize else {
+                throw fail("ROM archive exceeds the size limit.")
+            }
+
+            totalSize += entry.uncompressedSize
+
+            if entry.type == .file,
+               components.count >= 3,
+               components[1] == "machines" {
+                containsMachineROM = true
+            }
+        }
+
+        guard entryCount > 0,
+              containsMachineROM,
+              let root = rootName else {
+            throw fail("ROM archive is empty or incomplete.")
+        }
+
+        // The parent must be a real directory, not a symlink.
+        try fm.createDirectory(
+            at: parent,
+            withIntermediateDirectories: true
+        )
+
+        guard parent.path == parent.resolvingSymlinksInPath().path,
+              (try fm.attributesOfItem(
+                atPath: parent.path
+              )[.type] as? FileAttributeType) == .typeDirectory else {
+            throw fail("Unsafe ROM installation parent directory.")
+        }
+
+        // Refuse to start a new transaction if an older one
+        // left an original ROM collection parked.
+        let siblings = try fm.contentsOfDirectory(
+            atPath: parent.path
+        )
+
+        guard !siblings.contains(where: {
+            $0.hasPrefix(".MacBox-ROMs-parked-")
+        }) else {
+            throw fail(
+                "An interrupted ROM update needs recovery. " +
+                "No ROM files have been modified."
+            )
+        }
+
+        let identifier = UUID().uuidString
+
+        let workspace = parent.appendingPathComponent(
+            ".MacBox-ROMs-work-\(identifier)",
+            isDirectory: true
+        )
+
+        let extracted = workspace.appendingPathComponent(
+            "extracted",
+            isDirectory: true
+        )
+
+        let parked = parent.appendingPathComponent(
+            ".MacBox-ROMs-parked-\(identifier)",
+            isDirectory: true
+        )
+
+        let rejected = parent.appendingPathComponent(
+            ".MacBox-ROMs-rejected-\(identifier)",
+            isDirectory: true
+        )
+
+        try fm.createDirectory(
+            at: workspace,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+
+        defer {
+            try? fm.removeItem(at: workspace)
+        }
+
+        // ZIPFoundation performs extraction and checks file CRCs.
+        try fm.unzipItem(at: downloadedFile, to: extracted)
+
+        let staged = extracted.appendingPathComponent(
+            root,
+            isDirectory: true
+        )
+
+        let stagedMachines = staged.appendingPathComponent(
+            "machines",
+            isDirectory: true
+        )
+
+        var isDirectory: ObjCBool = false
+
+        guard fm.fileExists(
+            atPath: stagedMachines.path,
+            isDirectory: &isDirectory
+        ), isDirectory.boolValue else {
+            throw fail("Extracted ROM collection failed validation.")
+        }
+
+        // Protect the existing ROM collection before replacement.
+        let originalExists = fm.fileExists(
+            atPath: destination.path
+        )
+
+        if originalExists {
+            guard (
+                try fm.attributesOfItem(
+                    atPath: destination.path
+                )[.type] as? FileAttributeType
+            ) == .typeDirectory else {
+                throw fail("The existing ROM path is not a directory.")
+            }
+
+            let backups = parent.appendingPathComponent(
+                ".MacBox-ROMs-backups",
+                isDirectory: true
+            )
+
+            try fm.createDirectory(
+                at: backups,
+                withIntermediateDirectories: true
+            )
+
+            guard backups.path ==
+                    backups.resolvingSymlinksInPath().path else {
+                throw fail("Unsafe ROM backup directory.")
+            }
+
+            let backup = backups.appendingPathComponent(
+                "roms-\(identifier)",
+                isDirectory: true
+            )
+
+            // A backup must succeed before the original is moved.
+            try fm.copyItem(at: destination, to: backup)
+        }
+
+        var originalParked = false
+        var newInstalled = false
+
+        do {
+            if originalExists {
+                try fm.moveItem(at: destination, to: parked)
+                originalParked = true
+            }
+
+            try fm.moveItem(at: staged, to: destination)
+            newInstalled = true
+
+            var finalIsDirectory: ObjCBool = false
+
+            guard fm.fileExists(
+                atPath: destination
+                    .appendingPathComponent("machines").path,
+                isDirectory: &finalIsDirectory
+            ), finalIsDirectory.boolValue else {
+                throw fail("Installed ROM collection failed verification.")
+            }
+
+            // The independent backup already exists. Remove the
+            // parked original only after verifying the replacement.
+            if originalParked {
+                do {
+                    try fm.removeItem(at: parked)
+                } catch {
+                    NSLog(
+                        "MacBox: Retained parked ROMs: %@",
+                        parked.path
+                    )
+                }
+            }
+        } catch {
+            let installationError = error
+
+            do {
+                if newInstalled &&
+                    fm.fileExists(atPath: destination.path) {
+                    try fm.moveItem(at: destination, to: rejected)
+                }
+
+                if originalParked {
+                    try fm.moveItem(at: parked, to: destination)
+                }
+            } catch {
+                throw fail(
+                    "ROM installation failed, and automatic rollback " +
+                    "also failed. The original may remain at: " +
+                    parked.path + ". Rollback error: " +
+                    error.localizedDescription
+                )
+            }
+
+            throw installationError
+        }
+    }
+
+    // Update 86Box ROMs with the downloaded revision.
     private func updateRomsFile(location: URL) {
-        #if DEBUG || MACBOX_RELEASE_TEST
+        #if DEBUG
         NSLog("MacBoxDev: ROM installation blocked.")
         return
         #endif
 
-        var versionInfoObject = MainViewController.instance.versionInfoObject
-
-        var tempURL = homeDirURL
-        tempURL.appendPathComponent("tmp")
-
-        var fileURL = tempURL
-        fileURL.appendPathComponent(location.lastPathComponent + ".zip")
-
-        var unzippedRomsFileURL = tempURL
-        unzippedRomsFileURL.appendPathComponent("roms")
-
         do {
-            // Create the tmp directory
-            try fileManager.createDirectory(at: tempURL, withIntermediateDirectories: true, attributes: nil)
-            // Move the downloaded file into the tmp directory
-            try fileManager.moveItem(at: location, to: URL(fileURLWithPath: fileURL.path))
-            // Unzip the file
-            try fileManager.unzipItem(at: fileURL, to: unzippedRomsFileURL)
-            // Get the unzipped folder
-            let unzippedItems = try fileManager.contentsOfDirectory(atPath: unzippedRomsFileURL.path)
-            for item in unzippedItems {
-                if item.hasPrefix("86Box-roms") {
-                    var unzippedRomsFolderURL = unzippedRomsFileURL
-                    unzippedRomsFolderURL.appendPathComponent(item)
+            try installRomsTransaction(
+                downloadedFile: location
+            )
 
-                    if versionInfoObject.romsUrls.isEmpty {
-                        // 86Box ROMs are not installed; install them in the user application support directory
-                        let appSupportDir = fileManager.urls(for: .applicationSupportDirectory, in: [.userDomainMask])
-                        if var romsDirPath = appSupportDir.first {
-                            romsDirPath.appendPathComponent("net.86box.86Box/roms")
-                            // Create the 86Box ROMs directory
-                            try fileManager.createDirectory(at: romsDirPath, withIntermediateDirectories: true, attributes: nil)
-                            // Move the updated ROMs directory to the user's application support
-                            let _ = try fileManager.replaceItemAt(romsDirPath, withItemAt: unzippedRomsFolderURL)
-                            // Set user defaults
-                            if let romsSha = versionInfoObject.romsUpdateObject?.sha {
-                                userDefaults.set(romsSha, forKey: "romsShaVersion")
-                            }
-                            // Update version info
-                            versionInfoObject.romsUrls.append(romsDirPath)
-                        }
-                    }
-                    else {
-                        // Replace the ROMs directory with the updated one
-                        for romsURL in versionInfoObject.romsUrls {
-                            let _ = try fileManager.replaceItemAt(romsURL, withItemAt: unzippedRomsFolderURL)
-                            // Set user defaults
-                            if let romsSha = versionInfoObject.romsUpdateObject?.sha {
-                                userDefaults.set(romsSha, forKey: "romsShaVersion")
-                            }
-                        }
-                    }
-
-                    // Delete temporary file
-                    deleteTmpFile(url: fileURL)
-
-                    // Update version info
-                    MainViewController.instance.checkFor86Box(url: emulatorUpdatedURL, appVer: emulatorUpdatedAppVer, buildVer: emulatorUpdatedBuildVer)
-
-                    break
-                }
+            if let sha = MainViewController.instance
+                .versionInfoObject.romsUpdateObject?.sha {
+                userDefaults.set(sha, forKey: "romsShaVersion")
             }
 
-            // Update buttons status
             romsUpdateProgressIndicator.isHidden = true
             romsUpdateButton.isHidden = true
             romsUpdateCheckImageView.isHidden = false
-        } catch {
-            print("Error: \(error.localizedDescription)")
 
+            NSLog("MacBox: ROM installation completed.")
+        } catch {
             romsUpdateProgressIndicator.isHidden = true
             romsUpdateButton.isHidden = false
+            romsUpdateCheckImageView.isHidden = true
+
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "ROM installation failed"
+            alert.informativeText = error.localizedDescription
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+
+            NSLog(
+                "MacBox: ROM installation failed: %@",
+                error.localizedDescription
+            )
         }
     }
 
     // Fetch MacBox updated macOS binary
     private func fetchMacBoxUpdateBinary() {
+
         let versionInfoObject = MainViewController.instance.versionInfoObject
 
-        for asset in versionInfoObject.macboxUpdateObject?.assets ?? [] {
+        func reject(_ reason: String) {
+            macboxUpdateProgressIndicator.isHidden = true
+            macboxUpdateButton.isHidden = false
+
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "MacBox update unavailable"
+            alert.informativeText = reason
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+        }
+
+        let matchingAssets: [(asset: GithubAsset, url: URL)] = (
+            versionInfoObject.macboxUpdateObject?.assets ?? []
+        ).compactMap { asset in
+
             guard let downloadURL = asset.browser_download_url,
-                  let url = URL(string: downloadURL) else {
-                continue
+                  let url = URL(string: downloadURL),
+                  url.scheme?.lowercased() == "https",
+                  url.host?.lowercased() == "github.com",
+                  url.path.hasPrefix(
+                    "/settloe99/MacBox/releases/download/"
+                  ),
+                  url.pathExtension.lowercased() == "zip",
+                  url.lastPathComponent.lowercased().contains("macbox")
+            else {
+                return nil
             }
-            downloadMacBoxBinary(url: url)
+
+            return (asset: asset, url: url)
+        }
+
+        guard matchingAssets.count == 1,
+              let selected = matchingAssets.first else {
+
+            reject(
+                "Exactly one MacBox application ZIP must be " +
+                "present in the fork's GitHub release."
+            )
+            return
+        }
+
+        guard let digest = selected.asset.digest?.lowercased(),
+              digest.range(
+                of: "^sha256:[0-9a-f]{64}$",
+                options: .regularExpression
+              ) != nil else {
+
+            reject(
+                "The release package has no valid SHA-256 digest. " +
+                "The download has been cancelled."
+            )
+            return
+        }
+
+        let expectedSHA256 = String(digest.dropFirst(7))
+
+        NSLog(
+            "MacBox: Selected verified release asset: %@",
+            selected.url.lastPathComponent
+        )
+
+        downloadMacBoxBinary(
+            url: selected.url,
+            expectedSHA256: expectedSHA256
+        )
+    }
+
+    // Calculate the SHA-256 checksum of a downloaded application ZIP.
+    private func macBoxDownloadSHA256(
+        at fileURL: URL
+    ) throws -> String {
+
+        let attributes = try FileManager.default.attributesOfItem(
+            atPath: fileURL.path
+        )
+
+        guard let size = attributes[.size] as? NSNumber,
+              size.int64Value > 0,
+              size.int64Value <= 512 * 1024 * 1024 else {
+
+            throw NSError(
+                domain: "MacBox.Download",
+                code: 1,
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "The MacBox download has an invalid file size."
+                ]
+            )
+        }
+
+        let data = try Data(
+            contentsOf: fileURL,
+            options: .mappedIfSafe
+        )
+
+        var digest = [UInt8](
+            repeating: 0,
+            count: Int(CC_SHA256_DIGEST_LENGTH)
+        )
+
+        data.withUnsafeBytes { buffer in
+            _ = CC_SHA256(
+                buffer.baseAddress,
+                CC_LONG(buffer.count),
+                &digest
+            )
+        }
+
+        return digest.map {
+            String(format: "%02x", $0)
+        }.joined()
+    }
+
+    // Preserve a verified MacBox download for the external updater.
+    // URLSession temporary downloads may disappear after the callback.
+    private func stageVerifiedMacBoxDownload(
+        from temporaryURL: URL,
+        expectedSHA256: String
+    ) throws -> URL {
+
+        let fm = FileManager.default
+
+        func fail(_ message: String) -> NSError {
+            NSError(
+                domain: "MacBox.SelfUpdater",
+                code: 4,
+                userInfo: [
+                    NSLocalizedDescriptionKey: message
+                ]
+            )
+        }
+
+        guard let caches = fm.urls(
+            for: .cachesDirectory,
+            in: .userDomainMask
+        ).first?.standardizedFileURL else {
+            throw fail("User cache directory unavailable.")
+        }
+
+        let root = caches.appendingPathComponent(
+            "io.github.settloe99.MacBox",
+            isDirectory: true
+        )
+
+        let stagingDirectory = root.appendingPathComponent(
+            "StagedUpdates",
+            isDirectory: true
+        )
+
+        // Reject redirected paths before creating anything.
+        for directory in [caches, root, stagingDirectory] {
+            guard directory.path ==
+                    directory.resolvingSymlinksInPath().path else {
+                throw fail("Unsafe update staging directory.")
+            }
+        }
+
+        try fm.createDirectory(
+            at: stagingDirectory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+
+        guard stagingDirectory.path ==
+                stagingDirectory.resolvingSymlinksInPath().path,
+              let attributes = try? fm.attributesOfItem(
+                atPath: stagingDirectory.path
+              ),
+              attributes[.type] as? FileAttributeType ==
+                .typeDirectory else {
+            throw fail("Invalid update staging directory.")
+        }
+
+        let stagedFile = stagingDirectory.appendingPathComponent(
+            "\(UUID().uuidString).zip"
+        )
+
+        try fm.copyItem(
+            at: temporaryURL,
+            to: stagedFile
+        )
+
+        do {
+            try fm.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: stagedFile.path
+            )
+
+            // Verify that staging did not change the download.
+            let stagedSHA256 = try macBoxDownloadSHA256(
+                at: stagedFile
+            )
+
+            guard stagedSHA256 == expectedSHA256 else {
+                throw fail(
+                    "The staged MacBox update failed SHA-256 verification."
+                )
+            }
+
+            // Revalidate the preserved archive before handoff.
+            try validateMacBoxUpdateArchive(
+                at: stagedFile
+            )
+
+            NSLog(
+                "MacBox: Verified update staged at %@",
+                stagedFile.path
+            )
+
+            return stagedFile
+
+        } catch {
+            try? fm.removeItem(at: stagedFile)
+            throw error
         }
     }
 
     // Download MacBox binary
-    private func downloadMacBoxBinary(url: URL) {
+    private func downloadMacBoxBinary(
+        url: URL,
+        expectedSHA256: String
+    ) {
+
         let sessionConfig = URLSessionConfiguration.default
-        let session = URLSession(configuration: sessionConfig, delegate: self, delegateQueue: OperationQueue.main)
+
+        let session = URLSession(
+            configuration: sessionConfig,
+            delegate: self,
+            delegateQueue: OperationQueue.main
+        )
 
         let downloadTask = session.downloadTask(with: url)
+
+        // Associate the expected GitHub digest with this
+        // particular download task.
+        downloadTask.taskDescription = expectedSHA256
 
         let downloadInfo = DownloadInfo(
             type: .macbox,
@@ -1282,70 +1979,472 @@ class VersionManagerViewController: NSViewController {
         )
 
         downloadTasks.append(downloadInfo)
-
         downloadTask.resume()
     }
 
-    // Update MacBox binary with the new version
-    private func updateMacBoxBinary(location: URL) {
-        #if DEBUG || MACBOX_RELEASE_TEST
-        NSLog("MacBoxDev: application self-update blocked.")
-        return
+    // Validate a MacBox application ZIP before extraction.
+    // This function only inspects the archive and changes no files.
+    private func validateMacBoxUpdateArchive(
+        at downloadedFile: URL
+    ) throws {
+
+        func fail(_ message: String) -> NSError {
+            NSError(
+                domain: "MacBox.SelfUpdater",
+                code: 2,
+                userInfo: [
+                    NSLocalizedDescriptionKey: message
+                ]
+            )
+        }
+
+        guard let archive = try? Archive(
+            url: downloadedFile,
+            accessMode: .read
+        ) else {
+            throw fail("The MacBox download is not a valid ZIP archive.")
+        }
+
+        let maxEntries = 50_000
+        let maxExpandedSize: UInt64 = 2 * 1024 * 1024 * 1024
+
+        var entryCount = 0
+        var totalSize: UInt64 = 0
+        var seenPaths = Set<String>()
+
+        var containsInfoPlist = false
+        var containsExecutable = false
+
+        for entry in archive {
+            entryCount += 1
+
+            guard entryCount <= maxEntries,
+                  entry.type != .symlink else {
+                throw fail(
+                    "The MacBox archive contains unsupported or unsafe entries."
+                )
+            }
+
+            let path = entry.path
+
+            guard !path.hasPrefix("/"),
+                  !path.contains("\\"),
+                  !path.contains("\0") else {
+                throw fail("Unsafe MacBox archive filename.")
+            }
+
+            let trimmedPath = path.hasSuffix("/")
+                ? String(path.dropLast())
+                : path
+
+            let components = trimmedPath.split(
+                separator: "/",
+                omittingEmptySubsequences: false
+            )
+
+            guard !components.isEmpty,
+                  components.allSatisfy({
+                      !$0.isEmpty && $0 != "." && $0 != ".."
+                  }),
+                  components[0] == "MacBox.app" else {
+                throw fail(
+                    "Unexpected MacBox archive directory structure."
+                )
+            }
+
+            let normalisedPath = trimmedPath
+                .precomposedStringWithCanonicalMapping
+                .lowercased()
+
+            guard seenPaths.insert(normalisedPath).inserted else {
+                throw fail("Duplicate MacBox archive entry.")
+            }
+
+            guard entry.uncompressedSize <= maxExpandedSize,
+                  totalSize <=
+                    maxExpandedSize - entry.uncompressedSize else {
+                throw fail("MacBox archive exceeds the size limit.")
+            }
+
+            totalSize += entry.uncompressedSize
+
+            if entry.type == .file {
+                if trimmedPath == "MacBox.app/Contents/Info.plist" {
+                    containsInfoPlist = true
+                }
+
+                if trimmedPath == "MacBox.app/Contents/MacOS/MacBox" {
+                    containsExecutable = true
+                }
+            }
+        }
+
+        guard entryCount > 0,
+              containsInfoPlist,
+              containsExecutable else {
+            throw fail(
+                "The archive does not contain a complete MacBox application."
+            )
+        }
+
+        NSLog(
+            "MacBox: Application archive validation passed (%d entries).",
+            entryCount
+        )
+    }
+
+    // Select the application destination for a MacBox self-update.
+    // Release-Test must never replace the running MacBox application.
+    private func managedMacBoxUpdateDestination() throws -> URL {
+        let fm = FileManager.default
+
+        func fail(_ message: String) -> NSError {
+            NSError(
+                domain: "MacBox.SelfUpdater",
+                code: 1,
+                userInfo: [
+                    NSLocalizedDescriptionKey: message
+                ]
+            )
+        }
+
+        #if MACBOX_RELEASE_TEST
+
+        let root = fm.homeDirectoryForCurrentUser
+            .appendingPathComponent(
+                "MacBox-ReleaseTest",
+                isDirectory: true
+            ).standardizedFileURL
+
+        let destination = root.appendingPathComponent(
+            "MacBox-UpdateTarget.app",
+            isDirectory: true
+        ).standardizedFileURL
+
+        guard root.path == root.resolvingSymlinksInPath().path,
+              let rootAttributes = try? fm.attributesOfItem(
+                atPath: root.path
+              ),
+              rootAttributes[.type] as? FileAttributeType ==
+                .typeDirectory,
+              destination.path ==
+                destination.resolvingSymlinksInPath().path,
+              destination.path !=
+                Bundle.main.bundleURL.standardizedFileURL.path else {
+
+            throw fail(
+                "Unsafe Release-Test MacBox update destination."
+            )
+        }
+
+        if fm.fileExists(atPath: destination.path) {
+            guard let attributes = try? fm.attributesOfItem(
+                atPath: destination.path
+            ),
+            attributes[.type] as? FileAttributeType ==
+                .typeDirectory else {
+
+                throw fail(
+                    "Existing test application path is invalid."
+                )
+            }
+        }
+
+        return destination
+
+        #elseif DEBUG
+
+        throw fail(
+            "MacBox self-updates are disabled in DEBUG builds."
+        )
+
+        #else
+
+        return Bundle.main.bundleURL.standardizedFileURL
+
         #endif
+    }
 
-        var tempURL = homeDirURL
-        tempURL.appendPathComponent("tmp")
+    // Install a MacBox update transactionally.
+    // Initially enabled only for our isolated Release-Test laboratory.
+    private func installMacBoxUpdateTransaction(
+        downloadedFile: URL
+    ) throws {
 
-        var fileURL = tempURL
-        fileURL.appendPathComponent(location.lastPathComponent + ".zip")
+        func fail(_ message: String) -> NSError {
+            NSError(
+                domain: "MacBox.SelfUpdater",
+                code: 3,
+                userInfo: [
+                    NSLocalizedDescriptionKey: message
+                ]
+            )
+        }
 
-        var unzippedMacBoxFileURL = tempURL
-        unzippedMacBoxFileURL.appendPathComponent("MacBox.app")
+        #if MACBOX_RELEASE_TEST
+
+        let fm = FileManager.default
+
+        // Never install over the running application.
+        let destination = try managedMacBoxUpdateDestination()
+            .standardizedFileURL
+
+        let parent = destination.deletingLastPathComponent()
+
+        guard destination.lastPathComponent == "MacBox-UpdateTarget.app",
+              destination != Bundle.main.bundleURL.standardizedFileURL,
+              destination.path == destination.resolvingSymlinksInPath().path,
+              parent.path == parent.resolvingSymlinksInPath().path else {
+            throw fail("Unsafe MacBox update destination.")
+        }
+
+        // Validate the downloaded archive before any extraction.
+        try validateMacBoxUpdateArchive(at: downloadedFile)
+
+        // Refuse to overwrite an interrupted installation.
+        let siblings = try fm.contentsOfDirectory(
+            atPath: parent.path
+        )
+
+        guard !siblings.contains(where: {
+            $0.hasPrefix(".MacBox-SelfUpdate-parked-")
+        }) else {
+            throw fail(
+                "An interrupted MacBox installation requires recovery."
+            )
+        }
+
+        let identifier = UUID().uuidString
+
+        let workspace = parent.appendingPathComponent(
+            ".MacBox-SelfUpdate-work-\(identifier)",
+            isDirectory: true
+        )
+
+        let extracted = workspace.appendingPathComponent(
+            "extracted",
+            isDirectory: true
+        )
+
+        let staged = extracted.appendingPathComponent(
+            "MacBox.app",
+            isDirectory: true
+        )
+
+        let parked = parent.appendingPathComponent(
+            ".MacBox-SelfUpdate-parked-\(identifier).app",
+            isDirectory: true
+        )
+
+        let rejected = parent.appendingPathComponent(
+            ".MacBox-SelfUpdate-rejected-\(identifier).app",
+            isDirectory: true
+        )
+
+        try fm.createDirectory(
+            at: workspace,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+
+        defer {
+            try? fm.removeItem(at: workspace)
+        }
+
+        // Extract into the temporary workspace, never the destination.
+        try fm.unzipItem(at: downloadedFile, to: extracted)
+
+        // Verify the extracted application bundle.
+        guard let stagedBundle = Bundle(url: staged),
+              stagedBundle.bundleIdentifier ==
+                "io.github.settloe99.MacBoxReleaseTest",
+              stagedBundle.object(
+                forInfoDictionaryKey: "CFBundleExecutable"
+              ) as? String == "MacBox" else {
+            throw fail(
+                "The extracted application has an unexpected identity."
+            )
+        }
+
+        let executable = staged.appendingPathComponent(
+            "Contents/MacOS/MacBox"
+        )
+
+        guard let executableAttributes = try? fm.attributesOfItem(
+                atPath: executable.path
+              ),
+              executableAttributes[.type] as? FileAttributeType ==
+                .typeRegular,
+              fm.isExecutableFile(atPath: executable.path) else {
+            throw fail(
+                "The extracted MacBox executable is invalid."
+            )
+        }
+
+        // Check whether a previous test application exists.
+        let originalExists = fm.fileExists(
+            atPath: destination.path
+        )
+
+        if originalExists {
+            guard let existingBundle = Bundle(url: destination),
+                  existingBundle.bundleIdentifier ==
+                    "io.github.settloe99.MacBoxReleaseTest" else {
+                throw fail(
+                    "The existing test application is not a valid MacBox."
+                )
+            }
+
+            // Preserve an independent backup before replacing anything.
+            let backups = parent.appendingPathComponent(
+                ".MacBox-SelfUpdate-backups",
+                isDirectory: true
+            )
+
+            try fm.createDirectory(
+                at: backups,
+                withIntermediateDirectories: true
+            )
+
+            guard backups.path ==
+                    backups.resolvingSymlinksInPath().path else {
+                throw fail("Unsafe MacBox backup directory.")
+            }
+
+            let backup = backups.appendingPathComponent(
+                "MacBox-\(identifier).app",
+                isDirectory: true
+            )
+
+            try fm.copyItem(
+                at: destination,
+                to: backup
+            )
+        }
+
+        var originalParked = false
+        var newInstalled = false
 
         do {
-            // Create the tmp directory
-            try fileManager.createDirectory(at: tempURL, withIntermediateDirectories: true, attributes: nil)
-            // Move the downloaded file into the tmp directory
-            try fileManager.moveItem(at: location, to: URL(fileURLWithPath: fileURL.path))
-            // Unzip the file
-            try fileManager.unzipItem(at: fileURL, to: tempURL)
-
-            let macboxAppURL = Bundle.main.bundleURL
-            let _ = try fileManager.replaceItemAt(macboxAppURL, withItemAt: unzippedMacBoxFileURL)
-
-            // Delete temporary file
-            deleteTmpFile(url: fileURL)
-
-            // Update buttons status
-            macboxUpdateProgressIndicator.isHidden = true
-            macboxUpdateButton.isHidden = true
-            macboxUpdateCheckImageView.isHidden = false
-
-            // Prompt the user to restart the app
-            let alert = NSAlert()
-
-            alert.messageText = NSLocalizedString("MacBox will now restart in order to apply the update", comment: "")
-            alert.alertStyle = .critical
-            alert.addButton(withTitle: NSLocalizedString("Restart", comment: ""))
-
-            // Show the alert
-            let alertResult = alert.runModal()
-            let taskLaunchPath = "/usr/bin/open"
-
-            if alertResult == .alertFirstButtonReturn {
-                let macboxAppPath = Bundle.main.bundlePath
-                let task = Process()
-                task.launchPath = taskLaunchPath
-                task.arguments = [macboxAppPath]
-                task.launch()
-                exit(0)
+            // Move the existing application aside.
+            if originalExists {
+                try fm.moveItem(
+                    at: destination,
+                    to: parked
+                )
+                originalParked = true
             }
-        } catch {
-            print("Error: \(error.localizedDescription)")
 
-            macboxUpdateProgressIndicator.isHidden = true
-            macboxUpdateButton.isHidden = false
+            // Install the staged replacement.
+            try fm.moveItem(
+                at: staged,
+                to: destination
+            )
+            newInstalled = true
+
+            // Verify the installed application again.
+            guard let installedBundle = Bundle(url: destination),
+                  installedBundle.bundleIdentifier ==
+                    "io.github.settloe99.MacBoxReleaseTest",
+                  fm.isExecutableFile(
+                    atPath: destination.appendingPathComponent(
+                        "Contents/MacOS/MacBox"
+                    ).path
+                  ) else {
+                throw fail(
+                    "Installed MacBox failed verification."
+                )
+            }
+
+            // The independent backup remains available.
+            if originalParked {
+                do {
+                    try fm.removeItem(at: parked)
+                } catch {
+                    NSLog(
+                        "MacBox: Retained parked application: %@",
+                        parked.path
+                    )
+                }
+            }
+
+            NSLog(
+                "MacBox: Test application installation completed."
+            )
+
+        } catch {
+            let installationError = error
+
+            // Roll back if any operation after replacement fails.
+            do {
+                if newInstalled &&
+                    fm.fileExists(atPath: destination.path) {
+                    try fm.moveItem(
+                        at: destination,
+                        to: rejected
+                    )
+                }
+
+                if originalParked {
+                    try fm.moveItem(
+                        at: parked,
+                        to: destination
+                    )
+                }
+            } catch {
+                throw fail(
+                    "MacBox installation and automatic rollback failed. " +
+                    "The original may remain at: " +
+                    parked.path +
+                    ". Rollback error: " +
+                    error.localizedDescription
+                )
+            }
+
+            throw installationError
         }
+
+        #else
+
+        // Production self-updates require a verified external
+        // replacement and relaunch mechanism.
+        throw fail(
+            "Transactional MacBox self-installation is not yet " +
+            "enabled outside Release-Test."
+        )
+
+        #endif
+    }
+
+    // Handle a downloaded MacBox application update.
+    // Production installation remains disabled until the
+    // authenticated external updater workflow is connected.
+    private func updateMacBoxBinary(location: URL) {
+
+        macboxUpdateProgressIndicator.isHidden = true
+        macboxUpdateButton.isHidden = false
+
+        NSLog(
+            "MacBox: Legacy self-installation blocked for %@",
+            location.lastPathComponent
+        )
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "MacBox self-update not yet available"
+
+        alert.informativeText = """
+        The application update was downloaded, but automatic
+        installation is not yet enabled.
+
+        MacBox is transitioning to a verified external updater
+        that safely replaces the application after it exits.
+
+        Your existing MacBox installation has not been modified.
+        """
+
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
     }
 
     // Delete a temporary file
@@ -1373,10 +2472,61 @@ class VersionManagerViewController: NSViewController {
 
     // 86Box ROMs update button action
     @IBAction func romsUpdateButtonAction(_ sender: NSButton) {
-        guard updaterPermitted(.roms) else { return }
+        #if MACBOX_RELEASE_TEST
+        let expectedDestination = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("MacBox-ReleaseTest/ROMs-Lab/roms", isDirectory: true)
+            .standardizedFileURL
+
+        do {
+            let actualDestination = try managedRomsDestination().standardizedFileURL
+
+            guard actualDestination == expectedDestination else {
+                let alert = NSAlert()
+                alert.alertStyle = .critical
+                alert.messageText = "ROM laboratory destination mismatch"
+                alert.informativeText = """
+                Expected:
+                \(expectedDestination.path)
+
+                Actual:
+                \(actualDestination.path)
+
+                The update has been cancelled.
+                """
+                alert.runModal()
+                return
+            }
+
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "Release-Test ROM installation"
+            alert.informativeText = """
+            ROMs will be installed into the isolated test laboratory:
+
+            \(actualDestination.path)
+
+            Your normal ROM installation will not be modified.
+            """
+            alert.addButton(withTitle: "Continue")
+            alert.addButton(withTitle: "Cancel")
+
+            guard alert.runModal() == .alertFirstButtonReturn else {
+                return
+            }
+        } catch {
+            let alert = NSAlert()
+            alert.alertStyle = .critical
+            alert.messageText = "ROM destination validation failed"
+            alert.informativeText = error.localizedDescription
+            alert.runModal()
+            return
+        }
+        #endif
 
         romsUpdateButton.isHidden = true
         romsUpdateProgressIndicator.isHidden = false
+
+        // Download the exact ROM revision identified by the update check.
         fetchRomsUpdateFile()
     }
 
@@ -1459,9 +2609,114 @@ extension VersionManagerViewController: URLSessionDownloadDelegate {
         } else if info.type == .roms {
             updateRomsFile(location: location)
 
-        } else {
-            updateMacBoxBinary(location: location)
+        } else if info.type == .macbox {
+
+            do {
+                let statusCode = (
+                    downloadTask.response as? HTTPURLResponse
+                )?.statusCode ?? 0
+
+                guard statusCode == 200 else {
+                    throw NSError(
+                        domain: "MacBox.Download",
+                        code: 2,
+                        userInfo: [
+                            NSLocalizedDescriptionKey:
+                                "Download returned HTTP \(statusCode)."
+                        ]
+                    )
+                }
+
+                guard let expectedSHA256 = downloadTask.taskDescription,
+                      expectedSHA256.range(
+                        of: "^[0-9a-f]{64}$",
+                        options: .regularExpression
+                      ) != nil else {
+
+                    throw NSError(
+                        domain: "MacBox.Download",
+                        code: 3,
+                        userInfo: [
+                            NSLocalizedDescriptionKey:
+                                "Expected SHA-256 digest is missing."
+                        ]
+                    )
+                }
+
+                let actualSHA256 = try macBoxDownloadSHA256(
+                    at: location
+                )
+
+                guard actualSHA256 == expectedSHA256 else {
+                    throw NSError(
+                        domain: "MacBox.Download",
+                        code: 4,
+                        userInfo: [
+                            NSLocalizedDescriptionKey:
+                                "MacBox download checksum mismatch. " +
+                                "The package has been rejected."
+                        ]
+                    )
+                }
+
+                let handle = try FileHandle(
+                    forReadingFrom: location
+                )
+
+                let signature = handle.readData(ofLength: 4)
+                handle.closeFile()
+
+                guard signature ==
+                    Data([0x50, 0x4B, 0x03, 0x04]) else {
+
+                    throw NSError(
+                        domain: "MacBox.Download",
+                        code: 5,
+                        userInfo: [
+                            NSLocalizedDescriptionKey:
+                                "The download is not a valid ZIP package."
+                        ]
+                    )
+                }
+
+                // Verify archive contents after the SHA-256 check.
+                // Reject malformed archives before installation.
+                try validateMacBoxUpdateArchive(at: location)
+
+                NSLog(
+                    "MacBox: Release checksum and archive structure verified."
+                )
+
+                // Preserve the verified download before URLSession
+                // removes its temporary file.
+                let stagedUpdate = try stageVerifiedMacBoxDownload(
+                    from: location,
+                    expectedSHA256: expectedSHA256
+                )
+
+                // Production installation remains disabled until
+                // the authenticated external helper is connected.
+                updateMacBoxBinary(location: stagedUpdate)
+
+            } catch {
+
+                macboxUpdateProgressIndicator.isHidden = true
+                macboxUpdateButton.isHidden = false
+
+                NSLog(
+                    "MacBox: Download verification failed: %@",
+                    error.localizedDescription
+                )
+
+                let alert = NSAlert()
+                alert.alertStyle = .critical
+                alert.messageText = "MacBox download rejected"
+                alert.informativeText = error.localizedDescription
+                alert.addButton(withTitle: "OK")
+                alert.runModal()
+            }
         }
+
     }
 
     // Handle download progress

@@ -1511,14 +1511,34 @@ class MainViewController: NSViewController {
         // Check location related to system library
         let appSupportDir = fileManager.urls(for: .applicationSupportDirectory, in: [.userDomainMask, .systemDomainMask])
         for dir in appSupportDir {
-            let romsDirPath = dir.relativePath + "/net.86box.86Box/roms"
-            var isDirectory : ObjCBool = false
-            if fileManager.fileExists(atPath: romsDirPath, isDirectory: &isDirectory) {
-                if isDirectory.boolValue {
-                    // ROMs directory exists; Check if it's not empty
-                    if fileManager.sizeOfDirectory(atPath: romsDirPath) != 0 {
-                        versionInfoObject.romsUrls.append(URL(fileURLWithPath: romsDirPath))
-                    }
+            for relativePath in [
+                "86Box/roms",
+                "net.86box.86Box/roms"
+            ] {
+                let romsURL = dir.appendingPathComponent(
+                    relativePath,
+                    isDirectory: true
+                )
+
+                guard romsURL.path ==
+                        romsURL.resolvingSymlinksInPath().path
+                else {
+                    continue
+                }
+
+                var isDirectory: ObjCBool = false
+
+                if fileManager.fileExists(
+                    atPath: romsURL.path,
+                    isDirectory: &isDirectory
+                ),
+                   isDirectory.boolValue,
+                   fileManager.sizeOfDirectory(
+                    atPath: romsURL.path
+                   ) != 0,
+                   !versionInfoObject.romsUrls.contains(romsURL) {
+
+                    versionInfoObject.romsUrls.append(romsURL)
                 }
             }
         }
@@ -1681,40 +1701,93 @@ class MainViewController: NSViewController {
         }
     }
 
-    // Fetch MacBox update info from GitHub
+    // Fetch MacBox releases from our maintained fork.
     private func fetchMacBoxUpdateInfo() {
-        if let url = URL(string: "https://api.github.com/repos/Moonif/MacBox/releases/latest") {
-            var request = URLRequest(url: url)
-            request.httpMethod = "GET"
-            request.setValue(httpHeaderAcceptValue, forHTTPHeaderField: "Accept")
-            request.setValue(httpHeaderContentTypeValue, forHTTPHeaderField: "Content-Type")
 
-            let task = URLSession.shared.dataTask(with: request) {(data, response, error) in
-                guard let data = data else { return }
-
-                do {
-                    // Try getting the MacBox repo info from GitHub
-                    let githubJsonResponse = try JSONDecoder().decode(GithubResponseObject.self, from: data)
-                    self.versionInfoObject.macboxUpdateObject = githubJsonResponse
-
-                    // Compare versions
-                    if let latestTagVersion = githubJsonResponse.tag_name {
-                        let localBuildVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? String(latestTagVersion)
-
-                        if localBuildVersion != String(latestTagVersion) {
-                            // New version found
-                            self.numberOfUpdates += 1
-                        }
-                    }
-
-                    // Update the version status
-                    self.updateVersionStatus()
-                } catch {
-                    print("Error: \(error.localizedDescription)")
-                }
-            }
-            task.resume()
+        guard let url = URL(
+            string: "https://api.github.com/repos/settloe99/MacBox/releases/latest"
+        ) else {
+            return
         }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue(
+            httpHeaderAcceptValue,
+            forHTTPHeaderField: "Accept"
+        )
+        request.setValue(
+            httpHeaderContentTypeValue,
+            forHTTPHeaderField: "Content-Type"
+        )
+
+        let task = URLSession.shared.dataTask(
+            with: request
+        ) { data, response, error in
+
+            if let error = error {
+                NSLog(
+                    "MacBox: Release check failed: %@",
+                    error.localizedDescription
+                )
+                self.updateVersionStatus()
+                return
+            }
+
+            guard let httpResponse = response as? HTTPURLResponse else {
+                self.updateVersionStatus()
+                return
+            }
+
+            // Our fork has no published release yet.
+            // This is not evidence that an update is available.
+            if httpResponse.statusCode == 404 {
+                self.versionInfoObject.macboxUpdateObject = nil
+                NSLog("MacBox: No published fork release available.")
+                self.updateVersionStatus()
+                return
+            }
+
+            guard httpResponse.statusCode == 200,
+                  let data = data else {
+                NSLog(
+                    "MacBox: Release API returned HTTP %d",
+                    httpResponse.statusCode
+                )
+                self.updateVersionStatus()
+                return
+            }
+
+            do {
+                let release = try JSONDecoder().decode(
+                    GithubResponseObject.self,
+                    from: data
+                )
+
+                self.versionInfoObject.macboxUpdateObject = release
+
+                if let latestVersion = release.tag_name {
+                    let installedVersion = Bundle.main.object(
+                        forInfoDictionaryKey: "CFBundleShortVersionString"
+                    ) as? String
+
+                    if let installedVersion = installedVersion,
+                       installedVersion != latestVersion {
+                        self.numberOfUpdates += 1
+                    }
+                }
+
+            } catch {
+                NSLog(
+                    "MacBox: Cannot decode fork release: %@",
+                    error.localizedDescription
+                )
+            }
+
+            self.updateVersionStatus()
+        }
+
+        task.resume()
     }
 
     // Update the version status

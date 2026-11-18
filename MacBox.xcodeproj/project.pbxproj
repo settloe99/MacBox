@@ -201,6 +201,7 @@
 				F9D6077B29E2BABE002541BF /* Sources */,
 				F9D6077C29E2BABE002541BF /* Frameworks */,
 				F9D6077D29E2BABE002541BF /* Resources */,
+				4B6B2A0830AE1D82002F0052 /* Embed Release-Test Self-Updater Helper */,
 			);
 			buildRules = (
 			);
@@ -265,6 +266,30 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		4B6B2A0830AE1D82002F0052 /* Embed Release-Test Self-Updater Helper */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+				"$(SRCROOT)/Scripts/build-self-update-helper.sh",
+				"$(SRCROOT)/MacBox/Helpers/MacBoxSelfUpdateHelper.swift",
+			);
+			name = "Embed Release-Test Self-Updater Helper";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(TARGET_BUILD_DIR)/$(WRAPPER_NAME)/Contents/Helpers/MacBoxSelfUpdateHelper",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "\"$SRCROOT/Scripts/build-self-update-helper.sh\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		F9D6077B29E2BABE002541BF /* Sources */ = {
@@ -491,7 +516,7 @@
 				);
 				MACOSX_DEPLOYMENT_TARGET = 10.14;
 				MARKETING_VERSION = 0.6.3;
-				PRODUCT_BUNDLE_IDENTIFIER = Moonif.MacBox;
+				PRODUCT_BUNDLE_IDENTIFIER = io.guthub.settloe99.MacBox;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				SWIFT_EMIT_LOC_STRINGS = YES;
