@@ -1,21 +1,51 @@
 # MacBox for 86Box
 
-[![License](https://img.shields.io/github/license/Moonif/MacBox)](LICENSE) [![Latest release](https://img.shields.io/github/release/Moonif/MacBox.svg)](https://github.com/Moonif/MacBox/releases) [![Downloads](https://img.shields.io/github/downloads/Moonif/MacBox/total.svg)](https://github.com/Moonif/MacBox/releases) [![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=Moonif_MacBox&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=Moonif_MacBox)
+A community-maintained fork of [MacBox by Moonif](https://github.com/Moonif/MacBox), providing a macOS interface for managing virtual machines running in [86Box](https://github.com/86Box/86Box).
 
-MacBox is an optional manager app for the [86Box emulator](https://github.com/86Box/86Box) to make it easier to handle multiple virtual machines.
-<br/>It's written in Swift and supports both Apple Silicon and Intel based machines.
+## Features
 
-![MacBox](https://github.com/Moonif/MacBox/raw/main/Screenshots/MacBox.png)
+- Create and manage multiple virtual machines.
+- Create virtual machines from hardware-based templates.
+- Import existing 86Box virtual machines.
+- Manage 86Box application and ROM updates.
+- Check for MacBox application updates.
+- Select a custom 86Box version for individual virtual machines.
 
-# Features
-* Create and manage multiple virtual machines.
-* You can create virtual machines from templates based on real hardware settings.
-* Easily import previously created 86Box virtual machines into MacBox.
-* Keep your 86Box, ROMs and MacBox up-to-date with the built-in version manager.
-* Set a custom 86Box version for each virtual machine.
+## Download
 
-# Screenshot
-![MacBoxTemplates](https://github.com/Moonif/MacBox/raw/main/Screenshots/Screenshot.png)
+Download MacBox from the [settloe99/MacBox releases page](https://github.com/settloe99/MacBox/releases).
 
-# System requirements
-* macOS Mojave 10.14 or higher.
+### Compatibility
+
+The initial maintained release targets:
+
+- Apple Silicon Macs (ARM64).
+- macOS 12 Monterey or later.
+
+Intel Mac support and older macOS versions have not yet been verified for this release. They should not be assumed compatible.
+
+### macOS security
+
+MacBox is distributed with ad-hoc code signing. It is not signed with an Apple Developer ID certificate or notarised by Apple.
+
+macOS may block the application when it is first opened. If you trust the download and choose to allow it, attempt to open MacBox, then visit **System Settings > Privacy & Security > Open Anyway**.
+
+See [Apple's instructions](https://support.apple.com/en-gb/guide/mac-help/mh40617/mac).
+
+Do not disable Gatekeeper system-wide.
+
+### Release authentication
+
+Releases include:
+
+- `MacBox-v<version>.zip`: the application package.
+- `MacBox-release.manifest`: release version and SHA-256 checksum.
+- `MacBox-release.manifest.sig`: cryptographic signature.
+
+The maintained updater uses an embedded public key to authenticate release manifests and verify update packages. Ad-hoc code signing does not provide Apple-verified publisher identity.
+
+## Original project
+
+MacBox was originally created by [Moonif](https://github.com/Moonif/MacBox). This fork preserves the original project's attribution and licence.
+
+See [LICENSE](LICENSE) for licence terms.
