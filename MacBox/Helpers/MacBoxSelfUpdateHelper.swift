@@ -1,3 +1,4 @@
+import CommonCrypto
 import Foundation
 import Darwin
 import Security
@@ -5,10 +6,7 @@ import Security
 private let fm = FileManager.default
 private let laboratoryID = "io.github.settloe99.MacBoxReleaseTest"
 private let productionID = "io.github.settloe99.MacBox"
-
-// Production updates remain disabled until we have verified
-// our own Apple Developer ID signing identity.
-private let trustedProductionTeamID: String? = nil
+private let trustedReleasePublicKeyX963Base64 = "BPHbb2OKp2V4N6pt7FQed4PIbdlkIcA2NkXWF2uBA+cyN9CtX+NhKUsF6hfZ7fB6XXLs793Kv7G2XBJyle6yvbg="
 
 private func fail(_ message: String) -> NSError {
     return NSError(
@@ -54,86 +52,218 @@ private func validateApp(
     }
 }
 
-private func validateProductionApp(_ url: URL) throws {
+// Authenticate a release manifest with our embedded P-256 public key.
+// This does not install or modify any application.
+private func verifyMacBoxReleaseManifest(
+    manifestURL: URL,
+    signatureURL: URL
+) throws {
 
-    // Never accept production updates without a verified
-    // Apple Developer ID Team ID.
-    guard let teamID = trustedProductionTeamID,
-          teamID.range(
-            of: "^[A-Z0-9]{10}$",
+    for file in [manifestURL, signatureURL] {
+        guard file.path == file.resolvingSymlinksInPath().path,
+              let attributes = try? fm.attributesOfItem(
+                atPath: file.path
+              ),
+              attributes[.type] as? FileAttributeType ==
+                .typeRegular,
+              let size = attributes[.size] as? NSNumber,
+              size.intValue > 0,
+              size.intValue <= 4096 else {
+            throw fail("Invalid release manifest or signature file.")
+        }
+    }
+
+    let manifest = try Data(contentsOf: manifestURL)
+    let signature = try Data(contentsOf: signatureURL)
+
+    guard let text = String(data: manifest, encoding: .utf8) else {
+        throw fail("Release manifest is not valid UTF-8.")
+    }
+
+    let lines = text.split(
+        separator: "\n",
+        omittingEmptySubsequences: false
+    )
+
+    guard lines.count == 4,
+          lines[0] == "macbox-release-v1",
+          lines[3].isEmpty,
+          String(lines[1]).range(
+            of: "^version=[0-9]+(\\.[0-9]+){1,3}$",
+            options: .regularExpression
+          ) != nil,
+          String(lines[2]).range(
+            of: "^sha256=[0-9a-f]{64}$",
             options: .regularExpression
           ) != nil else {
+        throw fail("Invalid MacBox release manifest format.")
+    }
 
+    guard let keyBytes = Data(
+        base64Encoded: trustedReleasePublicKeyX963Base64
+    ),
+    keyBytes.count == 65,
+    keyBytes.first == 0x04 else {
+        throw fail("Invalid embedded release public key.")
+    }
+
+    let attributes: [String: Any] = [
+        kSecAttrKeyType as String:
+            kSecAttrKeyTypeECSECPrimeRandom,
+        kSecAttrKeyClass as String:
+            kSecAttrKeyClassPublic,
+        kSecAttrKeySizeInBits as String: 256
+    ]
+
+    guard let publicKey = SecKeyCreateWithData(
+        keyBytes as CFData,
+        attributes as CFDictionary,
+        nil
+    ) else {
+        throw fail("Cannot load the release verification key.")
+    }
+
+    guard SecKeyVerifySignature(
+        publicKey,
+        .ecdsaSignatureMessageX962SHA256,
+        manifest as CFData,
+        signature as CFData,
+        nil
+    ) else {
         throw fail(
-            "Production self-updates are disabled until a " +
-            "trusted Developer ID signing identity is configured."
+            "MacBox release signature verification failed."
         )
     }
 
-    // Verify the application bundle structure and identity.
+    print("PASS: MacBox release signature authenticated.")
+}
+
+private func verifySignedMacBoxReleasePackage(
+    manifestURL: URL,
+    signatureURL: URL,
+    archiveURL: URL
+) throws -> String {
+
+    // First authenticate the release manifest using our
+    // embedded public key.
+    try verifyMacBoxReleaseManifest(
+        manifestURL: manifestURL,
+        signatureURL: signatureURL
+    )
+
+    let fm = FileManager.default
+
+    guard archiveURL.path ==
+            archiveURL.resolvingSymlinksInPath().path,
+          let attributes = try? fm.attributesOfItem(
+            atPath: archiveURL.path
+          ),
+          attributes[.type] as? FileAttributeType ==
+            .typeRegular,
+          let size = attributes[.size] as? NSNumber,
+          size.int64Value > 0,
+          size.int64Value <= 512 * 1024 * 1024 else {
+
+        throw fail(
+            "Invalid or unsafe MacBox release archive."
+        )
+    }
+
+    // The manifest format has already been validated
+    // and cryptographically authenticated.
+    let manifest = try String(
+        contentsOf: manifestURL,
+        encoding: .utf8
+    )
+
+    let lines = manifest.split(
+        separator: "\n",
+        omittingEmptySubsequences: false
+    )
+
+    let releaseVersion = String(
+        lines[1].dropFirst("version=".count)
+    )
+
+    let expectedSHA256 = String(
+        lines[2].dropFirst("sha256=".count)
+    )
+
+    // Calculate the checksum of the actual downloaded ZIP.
+    let archiveData = try Data(
+        contentsOf: archiveURL,
+        options: .mappedIfSafe
+    )
+
+    var digest = [UInt8](
+        repeating: 0,
+        count: Int(CC_SHA256_DIGEST_LENGTH)
+    )
+
+    archiveData.withUnsafeBytes { buffer in
+        _ = CC_SHA256(
+            buffer.baseAddress,
+            CC_LONG(buffer.count),
+            &digest
+        )
+    }
+
+    let actualSHA256 = digest.map {
+        String(format: "%02x", $0)
+    }.joined()
+
+    guard actualSHA256 == expectedSHA256 else {
+        throw fail(
+            "MacBox release package checksum does not match " +
+            "the authenticated release manifest."
+        )
+    }
+
+    print("PASS: Signed release package SHA-256 verified.")
+    print("Authenticated release version: \(releaseVersion)")
+
+    return releaseVersion
+}
+
+private func validateProductionApp(_ url: URL) throws {
+
+    // Confirm the application has our production bundle identity
+    // and the expected executable structure.
     try validateApp(
         url,
         expectedBundleID: productionID
     )
 
-    // Require an Apple-issued Developer ID Application
-    // certificate belonging to our trusted development team.
-    let requirementText = """
-    anchor apple generic and
-    identifier "\(productionID)" and
-    certificate leaf[subject.OU] = "\(teamID)" and
-    certificate 1[field.1.2.840.113635.100.6.2.6] exists and
-    certificate leaf[field.1.2.840.113635.100.6.1.13] exists
-    """
+    // Verify the application's code signature and nested code.
+    // Ad-hoc signatures are accepted. Unsigned applications
+    // and applications with invalid signatures are rejected.
+    let verification = Process()
 
-    var requirement: SecRequirement?
-
-    let requirementStatus = SecRequirementCreateWithString(
-        requirementText as CFString,
-        SecCSFlags(rawValue: 0),
-        &requirement
+    verification.executableURL = URL(
+        fileURLWithPath: "/usr/bin/codesign"
     )
 
-    guard requirementStatus == errSecSuccess,
-          let requiredSignature = requirement else {
+    verification.arguments = [
+        "--verify",
+        "--deep",
+        "--strict",
+        url.path
+    ]
 
+    verification.standardOutput = FileHandle.nullDevice
+    verification.standardError = FileHandle.nullDevice
+
+    try verification.run()
+    verification.waitUntilExit()
+
+    guard verification.terminationStatus == 0 else {
         throw fail(
-            "Could not create the production signing requirement."
+            "The MacBox application failed code-signature " +
+            "integrity verification."
         )
     }
 
-    // Load the application as a static code object.
-    var staticCode: SecStaticCode?
-
-    let creationStatus = SecStaticCodeCreateWithPath(
-        url as CFURL,
-        SecCSFlags(rawValue: 0),
-        &staticCode
-    )
-
-    guard creationStatus == errSecSuccess,
-          let applicationCode = staticCode else {
-
-        throw fail(
-            "Could not inspect the production application signature."
-        )
-    }
-
-    // Verify the signature and application resources.
-    let validationStatus = SecStaticCodeCheckValidity(
-        applicationCode,
-        SecCSFlags(rawValue: 0),
-        requiredSignature
-    )
-
-    guard validationStatus == errSecSuccess else {
-        throw fail(
-            "The production application failed Developer ID " +
-            "signature verification. Installation was rejected."
-        )
-    }
-
-    print("PASS: Production application signature verified.")
+    print("PASS: Production application code integrity verified.")
 }
 
 private func waitForParentExit(_ pid: pid_t) throws {
@@ -344,11 +474,117 @@ private func runLaboratoryInstallation(
     }
 }
 
-private func runProductionInstallation(
-    parentPID: pid_t,
-    source: URL,
-    destination: URL
-) throws {
+private func extractAuthenticatedMacBoxRelease(
+    manifestURL: URL,
+    signatureURL: URL,
+    archiveURL: URL,
+    workspace: URL
+) throws -> URL {
+
+    guard isRealDirectory(workspace) else {
+        throw fail("Unsafe release extraction workspace.")
+    }
+
+    // Check the input files before copying them into
+    // the helper's private installation workspace.
+    for input in [manifestURL, signatureURL, archiveURL] {
+        let file = input.standardizedFileURL
+
+        guard file.path == file.resolvingSymlinksInPath().path,
+              let attributes = try? fm.attributesOfItem(
+                atPath: file.path
+              ),
+              attributes[.type] as? FileAttributeType ==
+                .typeRegular else {
+            throw fail("Unsafe release input file.")
+        }
+    }
+
+    let localManifest = workspace.appendingPathComponent(
+        "MacBox-release.manifest"
+    )
+
+    let localSignature = workspace.appendingPathComponent(
+        "MacBox-release.manifest.sig"
+    )
+
+    let localArchive = workspace.appendingPathComponent(
+        "MacBox-update.zip"
+    )
+
+    // Copy the release files before verifying them.
+    // The verified copy is the one we will extract.
+    try fm.copyItem(at: manifestURL, to: localManifest)
+    try fm.copyItem(at: signatureURL, to: localSignature)
+    try fm.copyItem(at: archiveURL, to: localArchive)
+
+    // Authenticate the signed manifest and verify that
+    // the actual ZIP matches its authorised SHA-256.
+    let authenticatedVersion =
+        try verifySignedMacBoxReleasePackage(
+            manifestURL: localManifest,
+            signatureURL: localSignature,
+            archiveURL: localArchive
+        )
+
+    // Extract the authenticated ZIP using macOS ditto.
+    let extractor = Process()
+    extractor.executableURL = URL(
+        fileURLWithPath: "/usr/bin/ditto"
+    )
+
+    extractor.arguments = [
+        "-x",
+        "-k",
+        localArchive.path,
+        workspace.path
+    ]
+
+    try extractor.run()
+    extractor.waitUntilExit()
+
+    guard extractor.terminationStatus == 0 else {
+        throw fail("Authenticated MacBox ZIP extraction failed.")
+    }
+
+    let application = workspace.appendingPathComponent(
+        "MacBox.app",
+        isDirectory: true
+    )
+
+    // Validate the actual extracted application.
+    try validateApp(
+        application,
+        expectedBundleID: productionID
+    )
+
+    guard let bundle = Bundle(url: application),
+          let applicationVersion = bundle.object(
+            forInfoDictionaryKey: "CFBundleShortVersionString"
+          ) as? String,
+          applicationVersion == authenticatedVersion else {
+
+        throw fail(
+            "Extracted MacBox version does not match " +
+            "the authenticated release manifest."
+        )
+    }
+
+    print(
+        "PASS: Authenticated MacBox v\(authenticatedVersion) " +
+        "extracted and validated."
+    )
+
+    return application
+}
+
+    private func runProductionInstallation(
+        parentPID: pid_t,
+        manifestURL: URL,
+        signatureURL: URL,
+        archiveURL: URL,
+        destination: URL
+    ) throws {
 
     let home = fm.homeDirectoryForCurrentUser.standardizedFileURL
 
@@ -357,38 +593,41 @@ private func runProductionInstallation(
         isDirectory: true
     ).standardizedFileURL
 
-    let candidate = source.standardizedFileURL
     let target = destination.standardizedFileURL
-
-    let candidateParent = candidate.deletingLastPathComponent()
     let targetParent = target.deletingLastPathComponent()
 
-    // Only accept a staged application from our private
-    // update directory.
-    guard isRealDirectory(stagingRoot),
-          isRealDirectory(candidateParent),
-          candidateParent.deletingLastPathComponent() == stagingRoot,
-          UUID(uuidString: candidateParent.lastPathComponent) != nil,
-          candidate.lastPathComponent == "MacBox.app",
-          candidate.path == candidate.resolvingSymlinksInPath().path
-    else {
-        throw fail("Unsafe production update source.")
+    // All three release files must come directly from
+    // our private MacBox update staging directory.
+    guard isRealDirectory(stagingRoot) else {
+        throw fail("MacBox release staging directory is missing or unsafe.")
     }
 
-    // Only replace an existing, genuine MacBox application.
-    // Never accept an arbitrary application destination.
+    for input in [manifestURL, signatureURL, archiveURL] {
+        let file = input.standardizedFileURL
+
+        guard file.deletingLastPathComponent() == stagingRoot,
+              file.path == file.resolvingSymlinksInPath().path,
+              let attributes = try? fm.attributesOfItem(
+                atPath: file.path
+              ),
+              attributes[.type] as? FileAttributeType ==
+                .typeRegular else {
+
+            throw fail("Unsafe MacBox release input file.")
+        }
+    }
+
+    // Only replace an existing MacBox application.
     guard target.lastPathComponent == "MacBox.app",
           isRealDirectory(targetParent),
-          target.path == target.resolvingSymlinksInPath().path,
-          target != candidate
-    else {
+          isRealDirectory(target),
+          target.path == target.resolvingSymlinksInPath().path else {
+
         throw fail("Unsafe production application destination.")
     }
 
-    // This enforces the trusted Developer ID requirement.
-    // Currently it deliberately rejects ALL production updates
-    // because trustedProductionTeamID has not been configured.
-    try validateProductionApp(candidate)
+    // Production installation remains locked until the
+    // independent release-authentication path is complete.
     try validateProductionApp(target)
 
     let siblings = try fm.contentsOfDirectory(
@@ -437,10 +676,49 @@ private func runProductionInstallation(
 
     // Copy the authenticated replacement into a workspace
     // on the same filesystem as the existing application.
-    try fm.copyItem(at: candidate, to: staged)
 
-    // Verify the copied application again.
+    // Authenticate the signed release manifest and ZIP,
+    // then extract the verified application directly into
+    // our private installation workspace.
+    let authenticatedApplication =
+        try extractAuthenticatedMacBoxRelease(
+            manifestURL: manifestURL,
+            signatureURL: signatureURL,
+            archiveURL: archiveURL,
+            workspace: workspace
+        )
+
+    guard authenticatedApplication.standardizedFileURL ==
+            staged.standardizedFileURL else {
+
+        throw fail(
+            "Authenticated release extraction returned " +
+            "an unexpected application location."
+        )
+    }
+
+    // Production signature verification remains enforced.
     try validateProductionApp(staged)
+
+    // Reject updates that do not advance the installed version.
+    guard let existingBundle = Bundle(url: target),
+          let replacementBundle = Bundle(url: staged),
+          let existingVersion = existingBundle.object(
+            forInfoDictionaryKey: "CFBundleShortVersionString"
+          ) as? String,
+          let replacementVersion = replacementBundle.object(
+            forInfoDictionaryKey: "CFBundleShortVersionString"
+          ) as? String,
+          replacementVersion.compare(
+            existingVersion,
+            options: .numeric
+          ) == .orderedDescending else {
+
+        throw fail(
+            "The authenticated update must be newer " +
+            "than the installed MacBox version."
+        )
+    }
 
     // Do not replace the application while it is running.
     try waitForParentExit(parentPID)
@@ -561,6 +839,28 @@ private func main() throws {
         return
     }
 
+    if args.count == 3,
+       args[0] == "--verify-manifest" {
+
+        try verifyMacBoxReleaseManifest(
+            manifestURL: URL(fileURLWithPath: args[1]),
+            signatureURL: URL(fileURLWithPath: args[2])
+        )
+        return
+    }
+
+    if args.count == 4,
+       args[0] == "--verify-release-package" {
+
+        _ = try verifySignedMacBoxReleasePackage(
+            manifestURL: URL(fileURLWithPath: args[1]),
+            signatureURL: URL(fileURLWithPath: args[2]),
+            archiveURL: URL(fileURLWithPath: args[3])
+        )
+
+        return
+    }
+
     if args == ["--preflight"] {
         guard isRealDirectory(root) else {
             throw fail("Release-Test laboratory is missing.")
@@ -583,23 +883,32 @@ private func main() throws {
         return
     }
 
-    if args.count == 4,
+    if args.count == 6,
        args[0] == "--install-production",
        let pid = Int32(args[1]) {
 
-        let source = URL(
-            fileURLWithPath: args[2],
-            isDirectory: true
+        let manifest = URL(
+            fileURLWithPath: args[2]
+        )
+
+        let signature = URL(
+            fileURLWithPath: args[3]
+        )
+
+        let archive = URL(
+            fileURLWithPath: args[4]
         )
 
         let destination = URL(
-            fileURLWithPath: args[3],
+            fileURLWithPath: args[5],
             isDirectory: true
         )
 
         try runProductionInstallation(
             parentPID: pid,
-            source: source,
+            manifestURL: manifest,
+            signatureURL: signature,
+            archiveURL: archive,
             destination: destination
         )
 

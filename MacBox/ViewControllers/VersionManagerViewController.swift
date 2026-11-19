@@ -2545,21 +2545,245 @@ class VersionManagerViewController: NSViewController {
         }
     }
 
-    // Hand a verified MacBox update to the external updater.
-    // The running application is never replaced directly.
-    private func updateMacBoxBinary(location: URL) {
+    // Handle an incomplete or invalid MacBox release download.
+    private func reportMacBoxReleaseSidecarFailure(
+        stagedZIP: URL,
+        reason: String
+    ) {
+        let base = stagedZIP.deletingPathExtension()
 
-        #if DEBUG || MACBOX_RELEASE_TEST
+        // Remove incomplete release files.
+        for file in [
+            stagedZIP,
+            base.appendingPathExtension("manifest"),
+            base.appendingPathExtension("sig")
+        ] {
+            try? FileManager.default.removeItem(at: file)
+        }
 
-        // Development and Release-Test builds must never
-        // initiate a production application replacement.
         macboxUpdateProgressIndicator.isHidden = true
         macboxUpdateButton.isHidden = false
 
         NSLog(
-            "MacBox: Production self-update blocked in test build."
+            "MacBox: Release authentication files unavailable: %@",
+            reason
         )
 
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "MacBox release verification unavailable"
+        alert.informativeText = """
+        The complete authenticated release could not be downloaded.
+
+        \(reason)
+
+        Your existing MacBox installation has not been modified.
+        """
+
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+    }
+
+    // Download a small release authentication asset.
+    private func downloadMacBoxReleaseAsset(
+        _ url: URL,
+        completion: @escaping (Result<Data, Error>) -> Void
+    ) {
+        let request = URLRequest(
+            url: url,
+            cachePolicy: .reloadIgnoringLocalCacheData,
+            timeoutInterval: 30
+        )
+
+        URLSession.shared.dataTask(with: request) {
+            data, response, error in
+
+            if let error = error {
+                completion(.failure(error))
+                return
+            }
+
+            guard let http = response as? HTTPURLResponse,
+                  http.statusCode == 200,
+                  let data = data,
+                  !data.isEmpty,
+                  data.count <= 4096 else {
+
+                completion(.failure(NSError(
+                    domain: "MacBox.SelfUpdater",
+                    code: 7,
+                    userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "Could not download \(url.lastPathComponent)."
+                    ]
+                )))
+                return
+            }
+
+            completion(.success(data))
+        }.resume()
+    }
+
+    // Download the signed manifest and signature belonging
+    // to the same GitHub release as the verified application ZIP.
+    private func downloadMacBoxReleaseSidecars(
+        for stagedZIP: URL,
+        originalZIPURL: URL
+    ) {
+        guard originalZIPURL.scheme?.lowercased() == "https",
+              originalZIPURL.host?.lowercased() == "github.com",
+              originalZIPURL.path.hasPrefix(
+                "/settloe99/MacBox/releases/download/"
+              ),
+              originalZIPURL.pathExtension.lowercased() == "zip",
+              stagedZIP.pathExtension.lowercased() == "zip",
+              UUID(
+                uuidString: stagedZIP
+                    .deletingPathExtension()
+                    .lastPathComponent
+              ) != nil else {
+
+            reportMacBoxReleaseSidecarFailure(
+                stagedZIP: stagedZIP,
+                reason: "The release download location is invalid."
+            )
+            return
+        }
+
+        let releaseDirectory = originalZIPURL
+            .deletingLastPathComponent()
+
+        let manifestURL = releaseDirectory.appendingPathComponent(
+            "MacBox-release.manifest"
+        )
+
+        let signatureURL = releaseDirectory.appendingPathComponent(
+            "MacBox-release.manifest.sig"
+        )
+
+        // Download the manifest first.
+        downloadMacBoxReleaseAsset(manifestURL) {
+            [weak self] manifestResult in
+
+            guard let self = self else { return }
+
+            switch manifestResult {
+
+            case .failure(let error):
+                DispatchQueue.main.async { [weak self] in
+                    self?.reportMacBoxReleaseSidecarFailure(
+                        stagedZIP: stagedZIP,
+                        reason: error.localizedDescription
+                    )
+                }
+
+            case .success(let manifestData):
+
+                // Download the matching signature.
+                self.downloadMacBoxReleaseAsset(signatureURL) {
+                    [weak self] signatureResult in
+
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self = self else { return }
+
+                        switch signatureResult {
+
+                        case .failure(let error):
+                            self.reportMacBoxReleaseSidecarFailure(
+                                stagedZIP: stagedZIP,
+                                reason: error.localizedDescription
+                            )
+
+                        case .success(let signatureData):
+
+                            let base = stagedZIP
+                                .deletingPathExtension()
+
+                            let manifestFile = base
+                                .appendingPathExtension("manifest")
+
+                            let signatureFile = base
+                                .appendingPathExtension("sig")
+
+                            do {
+                                let fm = FileManager.default
+
+                                // Never overwrite existing release files.
+                                guard !fm.fileExists(
+                                    atPath: manifestFile.path
+                                ),
+                                !fm.fileExists(
+                                    atPath: signatureFile.path
+                                ),
+                                manifestFile.path ==
+                                    manifestFile.resolvingSymlinksInPath().path,
+                                signatureFile.path ==
+                                    signatureFile.resolvingSymlinksInPath().path
+                                else {
+                                    throw NSError(
+                                        domain: "MacBox.SelfUpdater",
+                                        code: 8,
+                                        userInfo: [
+                                            NSLocalizedDescriptionKey:
+                                                "Unsafe release staging files."
+                                        ]
+                                    )
+                                }
+
+                                try manifestData.write(
+                                    to: manifestFile,
+                                    options: .atomic
+                                )
+
+                                try signatureData.write(
+                                    to: signatureFile,
+                                    options: .atomic
+                                )
+
+                                try fm.setAttributes(
+                                    [.posixPermissions: 0o600],
+                                    ofItemAtPath: manifestFile.path
+                                )
+
+                                try fm.setAttributes(
+                                    [.posixPermissions: 0o600],
+                                    ofItemAtPath: signatureFile.path
+                                )
+
+                                NSLog(
+                                    "MacBox: Complete release assets staged."
+                                )
+
+                                // The production updater will now
+                                // authenticate the manifest, signature
+                                // and actual ZIP before installation.
+                                self.updateMacBoxBinary(
+                                    location: stagedZIP
+                                )
+
+                            } catch {
+                                self.reportMacBoxReleaseSidecarFailure(
+                                    stagedZIP: stagedZIP,
+                                    reason: error.localizedDescription
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Hand an authenticated MacBox release to the external updater.
+    // MacBox never replaces its own running application.
+    private func updateMacBoxBinary(location: URL) {
+
+        #if DEBUG || MACBOX_RELEASE_TEST
+
+        macboxUpdateProgressIndicator.isHidden = true
+        macboxUpdateButton.isHidden = false
+
+        NSLog("MacBox: Production self-update blocked in test build.")
         return
 
         #else
@@ -2568,98 +2792,145 @@ class VersionManagerViewController: NSViewController {
             NSError(
                 domain: "MacBox.SelfUpdater",
                 code: 6,
-                userInfo: [
-                    NSLocalizedDescriptionKey: message
-                ]
+                userInfo: [NSLocalizedDescriptionKey: message]
             )
         }
 
         do {
             let fm = FileManager.default
 
+            guard let caches = fm.urls(
+                for: .cachesDirectory,
+                in: .userDomainMask
+            ).first?.standardizedFileURL else {
+                throw fail("User cache directory unavailable.")
+            }
+
+            let stagingRoot = caches.appendingPathComponent(
+                "io.github.settloe99.MacBox/StagedUpdates",
+                isDirectory: true
+            ).standardizedFileURL
+
+            let archive = location.standardizedFileURL
+
+            // All three release files share one unique identifier.
+            // For example: UUID.zip, UUID.manifest and UUID.sig.
+            let basename = archive.deletingPathExtension()
+
+            let manifest = basename.appendingPathExtension(
+                "manifest"
+            )
+
+            let signature = basename.appendingPathExtension(
+                "sig"
+            )
+
             let destination = Bundle.main.bundleURL
                 .standardizedFileURL
 
-            // Only our production application can initiate
-            // a production update.
             guard Bundle.main.bundleIdentifier ==
                     "io.github.settloe99.MacBox",
-                  destination.lastPathComponent == "MacBox.app" else {
+                  destination.lastPathComponent == "MacBox.app",
+                  destination.path ==
+                    destination.resolvingSymlinksInPath().path else {
+                throw fail("Invalid production MacBox destination.")
+            }
 
-                throw fail(
-                    "This is not a production MacBox installation."
-                )
+            guard stagingRoot.path ==
+                    stagingRoot.resolvingSymlinksInPath().path,
+                  archive.deletingLastPathComponent() == stagingRoot,
+                  archive.pathExtension.lowercased() == "zip",
+                  UUID(uuidString: basename.lastPathComponent) != nil else {
+                throw fail("Invalid staged MacBox release location.")
+            }
+
+            // All three files must be ordinary files in the
+            // expected private staging directory.
+            for file in [archive, manifest, signature] {
+                guard file.deletingLastPathComponent() == stagingRoot,
+                      file.path == file.resolvingSymlinksInPath().path,
+                      let attributes = try? fm.attributesOfItem(
+                        atPath: file.path
+                      ),
+                      attributes[.type] as? FileAttributeType ==
+                        .typeRegular else {
+                    throw fail(
+                        "Missing or unsafe authenticated release file."
+                    )
+                }
             }
 
             let helper = destination.appendingPathComponent(
                 "Contents/Helpers/MacBoxSelfUpdateHelper"
             )
 
-            guard helper.path ==
-                    helper.resolvingSymlinksInPath().path,
+            guard helper.path == helper.resolvingSymlinksInPath().path,
                   fm.isExecutableFile(atPath: helper.path) else {
-
-                throw fail(
-                    "The external MacBox updater helper is missing."
-                )
+                throw fail("The external updater helper is missing.")
             }
 
-            // Verify an application using the helper's
-            // trusted Developer ID signing requirement.
-            func verifyProductionApplication(_ app: URL) throws {
+            // Execute a read-only verification command.
+            func verify(
+                arguments: [String],
+                failureMessage: String
+            ) throws {
 
-                let verification = Process()
-                verification.executableURL = helper
+                let process = Process()
+                process.executableURL = helper
+                process.arguments = arguments
+                process.standardOutput = FileHandle.nullDevice
+                process.standardError = FileHandle.nullDevice
 
-                verification.arguments = [
-                    "--verify-production-app",
-                    app.path
-                ]
+                try process.run()
+                process.waitUntilExit()
 
-                try verification.run()
-                verification.waitUntilExit()
-
-                guard verification.terminationStatus == 0 else {
-                    throw fail(
-                        "Production application authentication failed. " +
-                        "The update has been cancelled. " +
-                        "A trusted Developer ID signing identity " +
-                        "must be configured before automatic " +
-                        "updates can be enabled."
-                    )
+                guard process.terminationStatus == 0 else {
+                    throw fail(failureMessage)
                 }
             }
 
-            // Authenticate the currently installed application
-            // before preparing a replacement.
-            try verifyProductionApplication(destination)
+            // Confirm the currently installed application
+            // has valid code integrity.
+            try verify(
+                arguments: [
+                    "--verify-production-app",
+                    destination.path
+                ],
+                failureMessage:
+                    "The installed MacBox application failed " +
+                    "code-integrity verification."
+            )
 
-            // Extract the downloaded ZIP into our private
-            // staging directory.
-            let stagedApplication =
-                try prepareStagedMacBoxApplication(
-                    from: location
-                )
+            // Authenticate our signed manifest and confirm
+            // the downloaded ZIP matches its authorised SHA-256.
+            try verify(
+                arguments: [
+                    "--verify-release-package",
+                    manifest.path,
+                    signature.path,
+                    archive.path
+                ],
+                failureMessage:
+                    "The MacBox release failed cryptographic " +
+                    "authentication. Installation was cancelled."
+            )
 
-            // Authenticate the extracted replacement.
-            try verifyProductionApplication(stagedApplication)
-
-            // Both applications must pass authentication
-            // before the user is offered installation.
+            // These checks are repeated inside the helper
+            // using private copies before installation.
             let confirmation = NSAlert()
             confirmation.alertStyle = .warning
             confirmation.messageText = "Install MacBox update?"
 
             confirmation.informativeText = """
-            The downloaded MacBox update has passed archive,
-            checksum and application signature verification.
+            The MacBox release signature, package checksum
+            and installed application integrity have passed
+            verification.
 
-            MacBox will now close while its external updater
-            installs the replacement.
+            MacBox will close while the external updater
+            installs the authenticated replacement.
 
-            The existing application will be backed up before
-            replacement, and the updated application will
-            launch automatically.
+            Your existing application will be backed up
+            before replacement.
 
             Destination:
             \(destination.path)
@@ -2668,7 +2939,6 @@ class VersionManagerViewController: NSViewController {
             confirmation.addButton(
                 withTitle: "Update and Restart"
             )
-
             confirmation.addButton(
                 withTitle: "Cancel"
             )
@@ -2681,25 +2951,28 @@ class VersionManagerViewController: NSViewController {
                 return
             }
 
-            // Launch the independent updater.
-            // It will wait for this MacBox process to exit.
+            // The helper accepts the complete authenticated
+            // release, not an independently extracted app.
             let updater = Process()
             updater.executableURL = helper
 
             updater.arguments = [
                 "--install-production",
                 String(ProcessInfo.processInfo.processIdentifier),
-                stagedApplication.path,
+                manifest.path,
+                signature.path,
+                archive.path,
                 destination.path
             ]
 
             try updater.run()
 
             NSLog(
-                "MacBox: External production updater launched."
+                "MacBox: Authenticated external updater launched."
             )
 
-            // The helper now owns installation and relaunch.
+            // The helper waits for this process to terminate
+            // before installing and relaunching the application.
             NSApp.terminate(nil)
 
         } catch {
@@ -2708,7 +2981,7 @@ class VersionManagerViewController: NSViewController {
             macboxUpdateButton.isHidden = false
 
             NSLog(
-                "MacBox: Self-update preparation failed: %@",
+                "MacBox: Self-update authentication failed: %@",
                 error.localizedDescription
             )
 
@@ -2970,9 +3243,22 @@ extension VersionManagerViewController: URLSessionDownloadDelegate {
                     expectedSHA256: expectedSHA256
                 )
 
-                // Production installation remains disabled until
-                // the authenticated external helper is connected.
-                updateMacBoxBinary(location: stagedUpdate)
+                // Retrieve the signed manifest and its signature
+                // from the same GitHub release as the verified ZIP.
+                guard let originalReleaseURL =
+                        downloadTask.originalRequest?.url else {
+
+                    reportMacBoxReleaseSidecarFailure(
+                        stagedZIP: stagedUpdate,
+                        reason: "The original release URL was unavailable."
+                    )
+                    return
+                }
+
+                downloadMacBoxReleaseSidecars(
+                    for: stagedUpdate,
+                    originalZIPURL: originalReleaseURL
+                )
 
             } catch {
 
