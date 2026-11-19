@@ -25,21 +25,27 @@ class MainViewController: NSViewController {
     @IBOutlet weak var statusButton: NSButton!
     @IBOutlet weak var vmNameTextField: NSTextField!
     @IBOutlet var vmDescriptionTextView: NSTextView!
-    
+
     @IBOutlet weak var vmSpecMachine: NSTextField!
     @IBOutlet weak var vmSpecCPU: NSTextField!
     @IBOutlet weak var vmSpecRAM: NSTextField!
     @IBOutlet weak var vmSpecHDD: NSTextField!
     @IBOutlet weak var vmSpecMachineLogo: NSImageView!
-    
+
     // Instance
     private(set) static var instance: MainViewController!
-    
+
     // Variables
     let screensaverManager = ScreensaverManager()
     private let userDefaults = UserDefaults.standard
     private let fileManager = FileManager.default
-    var homeDirURL = URL(fileURLWithPath: "MacBox", isDirectory: true, relativeTo: FileManager.default.homeDirectoryForCurrentUser)
+    #if MACBOX_RELEASE_TEST
+        var homeDirURL = URL(fileURLWithPath: "MacBox-ReleaseTest", isDirectory: true, relativeTo: FileManager.default.homeDirectoryForCurrentUser)
+    #elseif DEBUG
+        var homeDirURL = URL(fileURLWithPath: "MacBox-Dev", isDirectory: true, relativeTo: FileManager.default.homeDirectoryForCurrentUser)
+    #else
+        var homeDirURL = URL(fileURLWithPath: "MacBox", isDirectory: true, relativeTo: FileManager.default.homeDirectoryForCurrentUser)
+    #endif
     var vmList: [VM] = []
     private var currentSelectedVM: Int?
     private var currentRunningVM: [RunningVMProcess] = []
@@ -58,12 +64,12 @@ class MainViewController: NSViewController {
     // Version info
     var versionInfoObject = VersionInfoObject()
     private var numberOfUpdates: Int = 0
-    
+
     // View did load
     override func viewDidLoad() {
         super.viewDidLoad()
         MainViewController.instance = self
-        
+
         // Set delegates
         vmsTableView.delegate = self
         vmsTableView.dataSource = self
@@ -71,7 +77,7 @@ class MainViewController: NSViewController {
         vmDescriptionTextView.delegate = self
         // Register table view for drag and drop
         vmsTableView.registerForDraggedTypes([dragDropType])
-        
+
         // Config views
         configView()
         // Set MacBox home directory
@@ -80,13 +86,44 @@ class MainViewController: NSViewController {
         initFiles()
         // Set screensaver & screen sleep preference
         setScreenSaver()
-        // Check for 86Box version
+                // Load the user's configured emulator preference.
         setEmulatorDefaultPath()
+
+        // Recover before normal emulator discovery. Production
+        // recovery uses the last destination recorded by the updater.
+        #if MACBOX_RELEASE_TEST
+        recoverInterrupted86BoxIfNeeded(
+            installedAppURL: homeDirURL.appendingPathComponent(
+                "86Box.app",
+                isDirectory: true
+            )
+        )
+        #elseif !DEBUG
+        if let recordedPath = UserDefaults.standard.string(
+            forKey: "MacBoxManaged86BoxPath"
+        ), recordedPath.hasPrefix("/") {
+
+            let recordedURL = URL(
+                fileURLWithPath: recordedPath,
+                isDirectory: true
+            ).standardizedFileURL
+
+            if recordedURL.lastPathComponent == "86Box.app" {
+                recoverInterrupted86BoxIfNeeded(
+                    installedAppURL: recordedURL
+                )
+            } else {
+                NSLog("MacBox: Invalid recorded recovery destination.")
+            }
+        }
+        #endif
+
+        // Check for 86Box version and updates.
         setEmulatorUpdateChannel()
         checkFor86Box()
         checkForRoms()
     }
-    
+
     // View will appear
     override func viewWillAppear() {
         // Set the Start VM button dynamic width based on localized title
@@ -96,7 +133,7 @@ class MainViewController: NSViewController {
         // Set the app's appearance
         setAppearance()
     }
-    
+
     // Set the app's appearance
     private func setAppearance() {
         if let appAppearance = userDefaults.string(forKey: "appAppearance") {
@@ -110,18 +147,1069 @@ class MainViewController: NSViewController {
             }
         }
     }
-    
+
     // Set screensaver & screen sleep preference
     private func setScreenSaver() {
         let disableScreensaver = userDefaults.bool(forKey: "disableScreensaver")
-        
+
         if disableScreensaver == true {
             screensaverManager.disableScreensaver()
         }
     }
-    
-    // Set 86Box default path
-    private func setEmulatorDefaultPath() {
+
+        #if !DEBUG
+        private func recoverInterrupted86BoxIfNeeded(
+            installedAppURL: URL
+        ) {
+            let fm = FileManager.default
+
+            let installed = installedAppURL.standardizedFileURL
+            let root = installed.deletingLastPathComponent()
+            let prefix = ".MacBox-86Box-previous-"
+
+            guard installed.isFileURL,
+                  installed.lastPathComponent == "86Box.app" else {
+                NSLog("MacBox: Invalid recovery destination.")
+                return
+            }
+
+            guard root.path == root.resolvingSymlinksInPath().path,
+                let names = try? fm.contentsOfDirectory(
+                    atPath: root.path
+                ) else {
+                NSLog("MacBoxReleaseTest: Unsafe recovery directory.")
+                return
+            }
+
+            let parkedNames = names.filter {
+                $0.hasPrefix(prefix) && $0.hasSuffix(".app")
+            }
+
+            let incomingNames = names.filter {
+                $0.hasPrefix(".MacBox-86Box-incoming-") &&
+                $0.hasSuffix(".app")
+            }
+
+            // An unfinished incoming application needs review.
+            // Do not automatically delete it or alter the
+            // installed emulator.
+            if !incomingNames.isEmpty {
+                let incomingPrefix = ".MacBox-86Box-incoming-"
+                var eligibleFolder: URL?
+                var folderWasEmpty = false
+
+                // Review one staging directory per recovery operation.
+                // Sorting ensures the same directory is selected each time.
+                let orderedIncomingNames = incomingNames.sorted()
+
+                if parkedNames.isEmpty,
+                   let name = orderedIncomingNames.first {
+                    let identifier = String(
+                        name.dropFirst(incomingPrefix.count).dropLast(4)
+                    )
+                    let folder = root.appendingPathComponent(
+                        name, isDirectory: true
+                    )
+
+                    if UUID(uuidString: identifier) != nil,
+                       folder.path == folder.resolvingSymlinksInPath().path,
+                       let attributes = try? fm.attributesOfItem(
+                           atPath: folder.path
+                       ),
+                       attributes[.type] as? FileAttributeType == .typeDirectory,
+                       let contents = try? fm.contentsOfDirectory(
+                           atPath: folder.path
+                       ),
+                       installed.path == installed.resolvingSymlinksInPath().path,
+                       let bundle = Bundle(url: installed),
+                       bundle.bundleIdentifier == "net.86Box.86Box" {
+                        eligibleFolder = folder
+                        folderWasEmpty = contents.isEmpty
+                    }
+                }
+
+                let selectedFolder = eligibleFolder
+                let wasEmpty = folderWasEmpty
+
+                DispatchQueue.main.async {
+                    let alert = NSAlert()
+                    alert.alertStyle = .warning
+                    alert.messageText = "Incomplete 86Box installation detected"
+                    let targetName = selectedFolder?.lastPathComponent
+                        ?? "Unavailable"
+
+                    alert.informativeText = """
+                    MacBox found \(incomingNames.count) unfinished staging item(s).
+
+                    Selected for review:
+                    \(targetName)
+
+                    Only the selected folder will be processed. All other staging items will remain unchanged.
+
+                    Empty folders can be removed. Nonempty folders can be moved into recovery quarantine without deleting their contents.
+
+                    Further updates remain blocked until all interrupted transactions are resolved.
+                    """
+
+                    if selectedFolder != nil {
+                        alert.addButton(
+                            withTitle: wasEmpty
+                                ? "Remove empty staging folder"
+                                : "Move to recovery quarantine"
+                        )
+                    }
+                    alert.addButton(withTitle: "Leave unchanged")
+
+                    let response = alert.runModal()
+
+                    guard response == .alertFirstButtonReturn,
+                          let folder = selectedFolder else {
+                        return
+                    }
+
+                    func recoveryError(_ message: String) -> NSError {
+                        NSError(
+                            domain: "MacBoxReleaseTest.Recovery",
+                            code: 1,
+                            userInfo: [NSLocalizedDescriptionKey: message]
+                        )
+                    }
+
+                    do {
+                        guard root.path == root.resolvingSymlinksInPath().path,
+                              folder.path == folder.resolvingSymlinksInPath().path,
+                              let attributes = try? fm.attributesOfItem(
+                                atPath: folder.path
+                              ),
+                              attributes[.type] as? FileAttributeType == .typeDirectory,
+                              installed.path == installed.resolvingSymlinksInPath().path,
+                              let bundle = Bundle(url: installed),
+                              bundle.bundleIdentifier == "net.86Box.86Box" else {
+                            throw recoveryError("Filesystem safety check failed.")
+                        }
+
+                        let currentNames = try fm.contentsOfDirectory(
+                            atPath: root.path
+                        )
+
+                        let currentIncoming = currentNames.filter {
+                            $0.hasPrefix(incomingPrefix) && $0.hasSuffix(".app")
+                        }
+                        let currentParked = currentNames.filter {
+                            $0.hasPrefix(".MacBox-86Box-previous-") &&
+                            $0.hasSuffix(".app")
+                        }
+
+                        guard currentIncoming.sorted() == orderedIncomingNames,
+                            currentIncoming.contains(folder.lastPathComponent),
+                            currentParked.isEmpty else {
+                            throw recoveryError(
+                                "Transaction state changed. No cleanup performed."
+                            )
+                        }
+
+                        let contents = try fm.contentsOfDirectory(
+                            atPath: folder.path
+                        )
+
+                        guard contents.isEmpty == wasEmpty else {
+                            throw recoveryError(
+                                "Staging folder contents changed. No cleanup performed."
+                            )
+                        }
+
+                        let result: String
+
+                        if wasEmpty {
+                            let process = Process()
+                            process.executableURL = URL(
+                                fileURLWithPath: "/bin/rmdir"
+                            )
+                            process.arguments = [folder.path]
+
+                            try process.run()
+                            process.waitUntilExit()
+
+                            guard process.terminationStatus == 0 else {
+                                throw recoveryError(
+                                    "The empty staging folder could not be removed."
+                                )
+                            }
+
+                            result = "The empty staging folder was removed."
+                        } else {
+                            let quarantine = root.appendingPathComponent(
+                                "86Box-recovery-quarantine",
+                                isDirectory: true
+                            )
+
+                            if !fm.fileExists(atPath: quarantine.path) {
+                                guard (try? fm.destinationOfSymbolicLink(
+                                    atPath: quarantine.path
+                                )) == nil else {
+                                    throw recoveryError(
+                                        "Quarantine destination is a symbolic link."
+                                    )
+                                }
+                                try fm.createDirectory(
+                                    at: quarantine,
+                                    withIntermediateDirectories: false
+                                )
+                            }
+
+                            guard quarantine.path ==
+                                    quarantine.resolvingSymlinksInPath().path,
+                                  let quarantineAttributes =
+                                    try? fm.attributesOfItem(
+                                        atPath: quarantine.path
+                                    ),
+                                  quarantineAttributes[.type] as?
+                                    FileAttributeType == .typeDirectory else {
+                                throw recoveryError(
+                                    "Quarantine directory is unsafe."
+                                )
+                            }
+
+                            let destination = quarantine.appendingPathComponent(
+                                folder.lastPathComponent,
+                                isDirectory: true
+                            )
+
+                            guard !fm.fileExists(atPath: destination.path),
+                                  (try? fm.destinationOfSymbolicLink(
+                                    atPath: destination.path
+                                  )) == nil else {
+                                throw recoveryError(
+                                    "A quarantine item already exists at that path."
+                                )
+                            }
+
+                            try fm.moveItem(at: folder, to: destination)
+
+                            guard fm.fileExists(atPath: destination.path),
+                                  !fm.fileExists(atPath: folder.path) else {
+                                throw recoveryError(
+                                    "Quarantine move requires manual verification."
+                                )
+                            }
+
+                            result = """
+                            The staging folder was moved into recovery quarantine.
+
+                            Its contents have been preserved at:
+
+                            \(destination.path)
+                            """
+                        }
+
+                        let success = NSAlert()
+                        success.alertStyle = .informational
+                        success.messageText = "Staging recovery completed"
+                        success.informativeText = result + """
+
+
+
+                        The installed emulator was not modified.
+                        """
+                        success.addButton(withTitle: "OK")
+                        success.runModal()
+
+                    } catch {
+                        let failure = NSAlert()
+                        failure.alertStyle = .warning
+                        failure.messageText = "Staging recovery failed"
+                        failure.informativeText = error.localizedDescription
+                        failure.addButton(withTitle: "OK")
+                        failure.runModal()
+                    }
+                }
+
+                return
+            }
+
+            // Also check the installed application when there is no
+            // interrupted transaction to recover.
+            if parkedNames.isEmpty {
+                let installedExists =
+                    fm.fileExists(atPath: installed.path) ||
+                    (try? fm.destinationOfSymbolicLink(
+                        atPath: installed.path
+                    )) != nil
+
+                if installedExists {
+                    func installedIsValid() -> Bool {
+                        guard installed.path ==
+                                installed.resolvingSymlinksInPath().path,
+                              let attributes = try? fm.attributesOfItem(
+                                atPath: installed.path
+                              ),
+                              attributes[.type] as? FileAttributeType ==
+                                .typeDirectory,
+                              let bundle = Bundle(url: installed),
+                              bundle.bundleIdentifier == "net.86Box.86Box",
+                              let version = bundle.infoDictionary?[
+                                "CFBundleVersion"
+                              ] as? String,
+                              !version.isEmpty else {
+                            return false
+                        }
+
+                        let executable = installed.appendingPathComponent(
+                            "Contents/MacOS/86Box"
+                        )
+
+                        for (tool, arguments) in [
+                            (
+                                "/usr/bin/codesign",
+                                ["--verify", "--deep", "--strict", installed.path]
+                            ),
+                            (
+                                "/usr/bin/lipo",
+                                ["-verify_arch", "arm64", executable.path]
+                            )
+                        ] {
+                            let process = Process()
+                            process.executableURL = URL(
+                                fileURLWithPath: tool
+                            )
+                            process.arguments = arguments
+
+                            do {
+                                try process.run()
+                                process.waitUntilExit()
+
+                                guard process.terminationStatus == 0 else {
+                                    return false
+                                }
+                            } catch {
+                                return false
+                            }
+                        }
+
+                        return true
+                    }
+
+                    if !installedIsValid() {
+                        NSLog(
+                            "MacBoxReleaseTest: Installed 86Box failed verification."
+                        )
+
+                        DispatchQueue.main.async {
+                            let alert = NSAlert()
+                            alert.alertStyle = .critical
+                            alert.messageText =
+                                "Installed 86Box application is damaged"
+
+                            alert.informativeText = """
+                            The installed 86Box application failed integrity or compatibility verification.
+
+                            \(installed.path)
+
+                            No previous application is parked for automatic recovery.
+
+                            MacBox has not modified or removed any files.
+
+                            Do not launch or update this emulator until its installation has been reviewed.
+                            """
+
+                            alert.addButton(withTitle: "Leave unchanged")
+                            alert.runModal()
+                        }
+                    }
+                }
+
+                return
+            }
+
+            // Check whether the installed application exists after
+            // validating the parked previous version below.
+
+            guard parkedNames.count == 1 else {
+                NSLog("MacBoxReleaseTest: Ambiguous recovery candidates.")
+                return
+            }
+
+            let name = parkedNames[0]
+            let identifier = String(
+                name.dropFirst(prefix.count).dropLast(4)
+            )
+
+            guard UUID(uuidString: identifier) != nil else {
+                NSLog("MacBoxReleaseTest: Invalid transaction identifier.")
+                return
+            }
+
+            let parked = root.appendingPathComponent(name)
+
+            func verifiedVersion(_ app: URL) -> String? {
+                return (try? EmulatorIntegrity.verify(app))?.bundleVersion
+            }
+
+            guard let originalVersion = verifiedVersion(parked) else {
+                NSLog("MacBoxReleaseTest: Parked emulator verification failed.")
+
+                let expectedInstalledVersion = verifiedVersion(installed)
+
+                DispatchQueue.main.async {
+                    let alert = NSAlert()
+                    alert.alertStyle = .warning
+                    alert.messageText =
+                        "Damaged previous 86Box installation detected"
+
+                    let installedStatus = expectedInstalledVersion != nil
+                        ? "The installed emulator passed verification."
+                        : "The installed emulator is missing or could not be verified."
+
+                    alert.informativeText = """
+                    An interrupted update left a previous 86Box application that failed verification.
+
+                    \(parked.path)
+
+                    \(installedStatus)
+
+                    The damaged application will not be restored or deleted automatically.
+
+                    If the installed emulator is valid, the damaged copy can be moved to recovery quarantine.
+
+                    Updates remain blocked until this interrupted transaction is resolved.
+                    """
+
+                    if expectedInstalledVersion != nil {
+                        alert.addButton(
+                            withTitle: "Move damaged copy to quarantine"
+                        )
+                    }
+                    alert.addButton(withTitle: "Leave unchanged")
+
+                    let response = alert.runModal()
+
+                    guard response == .alertFirstButtonReturn,
+                          let expectedVersion = expectedInstalledVersion else {
+                        return
+                    }
+
+                    func recoveryError(_ message: String) -> NSError {
+                        NSError(
+                            domain: "MacBoxReleaseTest.Recovery",
+                            code: 1,
+                            userInfo: [
+                                NSLocalizedDescriptionKey: message
+                            ]
+                        )
+                    }
+
+                    do {
+                        // Recheck both applications and the transaction
+                        // state before moving any files.
+                        guard root.path ==
+                                root.resolvingSymlinksInPath().path,
+                              parked.path ==
+                                parked.resolvingSymlinksInPath().path,
+                              let attributes = try? fm.attributesOfItem(
+                                atPath: parked.path
+                              ),
+                              attributes[.type] as? FileAttributeType ==
+                                .typeDirectory,
+                              verifiedVersion(installed) == expectedVersion,
+                              verifiedVersion(parked) == nil else {
+                            throw recoveryError(
+                                "Application verification or filesystem state changed."
+                            )
+                        }
+
+                        let currentNames = try fm.contentsOfDirectory(
+                            atPath: root.path
+                        )
+
+                        let currentParked = currentNames.filter {
+                            $0.hasPrefix(prefix) && $0.hasSuffix(".app")
+                        }
+                        let currentIncoming = currentNames.filter {
+                            $0.hasPrefix(".MacBox-86Box-incoming-") &&
+                            $0.hasSuffix(".app")
+                        }
+
+                        guard currentParked == [name],
+                              currentIncoming.isEmpty else {
+                            throw recoveryError(
+                                "Transaction state changed. No recovery performed."
+                            )
+                        }
+
+                        let quarantine = root.appendingPathComponent(
+                            "86Box-recovery-quarantine",
+                            isDirectory: true
+                        )
+
+                        // The quarantine must be an ordinary directory,
+                        // never a symbolic link.
+                        if !fm.fileExists(atPath: quarantine.path) {
+                            guard (try? fm.destinationOfSymbolicLink(
+                                atPath: quarantine.path
+                            )) == nil else {
+                                throw recoveryError(
+                                    "Quarantine path is a symbolic link."
+                                )
+                            }
+                            try fm.createDirectory(
+                                at: quarantine,
+                                withIntermediateDirectories: false
+                            )
+                        }
+
+                        guard quarantine.path ==
+                                quarantine.resolvingSymlinksInPath().path,
+                              let quarantineAttributes =
+                                try? fm.attributesOfItem(
+                                    atPath: quarantine.path
+                                ),
+                              quarantineAttributes[.type] as?
+                                FileAttributeType == .typeDirectory else {
+                            throw recoveryError(
+                                "Quarantine directory is unsafe."
+                            )
+                        }
+
+                        let destination = quarantine.appendingPathComponent(
+                            name,
+                            isDirectory: true
+                        )
+
+                        guard !fm.fileExists(atPath: destination.path),
+                              (try? fm.destinationOfSymbolicLink(
+                                atPath: destination.path
+                              )) == nil else {
+                            throw recoveryError(
+                                "A quarantine item already exists at this path."
+                            )
+                        }
+
+                        // Move, never recursively delete.
+                        try fm.moveItem(at: parked, to: destination)
+
+                        guard fm.fileExists(atPath: destination.path),
+                              !fm.fileExists(atPath: parked.path) else {
+                            throw recoveryError(
+                                "The move requires manual verification."
+                            )
+                        }
+
+                        let success = NSAlert()
+                        success.alertStyle = .informational
+                        success.messageText =
+                            "Damaged 86Box application quarantined"
+                        success.informativeText = """
+                        The damaged previous emulator has been moved to:
+
+                        \(destination.path)
+
+                        Its contents have been preserved.
+
+                        The installed emulator was not modified.
+                        """
+                        success.addButton(withTitle: "OK")
+                        success.runModal()
+
+                    } catch {
+                        let failure = NSAlert()
+                        failure.alertStyle = .warning
+                        failure.messageText =
+                            "Recovery could not be completed"
+                        failure.informativeText = """
+                        \(error.localizedDescription)
+
+                        Review the recovery directories before trying again.
+                        """
+                        failure.addButton(withTitle: "OK")
+                        failure.runModal()
+                    }
+                }
+
+                return
+            }
+
+            // An installed application may already be present if MacBox
+            // crashed after replacement but before cleanup.
+            let destinationOccupied =
+                fm.fileExists(atPath: installed.path) ||
+                (try? fm.destinationOfSymbolicLink(
+                    atPath: installed.path
+                )) != nil
+
+            if destinationOccupied {
+                let installedVersion = verifiedVersion(installed)
+                let message: String
+
+                if let installedVersion = installedVersion {
+                    let isNewer = installedVersion.compare(
+                        originalVersion,
+                        options: .numeric
+                    ) == .orderedDescending
+
+                    if isNewer {
+                        message = """
+                        An interrupted 86Box update was detected.
+
+                        Installed version: \(installedVersion)
+                        Previous version: \(originalVersion)
+
+                        Both applications passed verification.
+
+                        The installed application has been preserved.
+                        The previous application has also been retained.
+
+                        No files have been changed.
+
+                        Further updates remain blocked until the
+                        interrupted transaction has been reviewed.
+                        """
+                    } else {
+                        message = """
+                        An interrupted 86Box update was detected.
+
+                        Installed version: \(installedVersion)
+                        Parked version: \(originalVersion)
+
+                        Both applications passed verification, but
+                        their version order is unexpected.
+
+                        No files have been changed.
+                        Manual review is required.
+                        """
+                    }
+                } else {
+                    message = """
+                    An interrupted 86Box update was detected.
+
+                    The installed application could not be verified.
+                    The parked previous version passed verification.
+
+                    Neither application has been modified.
+
+                    Manual recovery is required.
+                    """
+                }
+
+                NSLog("MacBoxReleaseTest: %@", message)
+
+                // Recover a damaged existing installation only
+                // when a verified previous application is available.
+                if installedVersion == nil &&
+                   fm.fileExists(atPath: installed.path) {
+                    DispatchQueue.main.async {
+                        let alert = NSAlert()
+                        alert.alertStyle = .warning
+                        alert.messageText =
+                            "Damaged 86Box installation detected"
+
+                        alert.informativeText = """
+                        The installed 86Box application failed verification.
+
+                        The parked build \(originalVersion) passed verification.
+
+                        MacBox can preserve the damaged application in quarantine and restore the verified previous version.
+
+                        The damaged application will be preserved in quarantine before restoration.
+                        """
+
+                        alert.addButton(
+                            withTitle: "Quarantine damaged copy and restore previous"
+                        )
+                        alert.addButton(withTitle: "Leave unchanged")
+
+                        guard alert.runModal() ==
+                                .alertFirstButtonReturn else {
+                            return
+                        }
+
+                        func recoveryError(_ message: String) -> NSError {
+                            NSError(
+                                domain: "MacBoxReleaseTest.Recovery",
+                                code: 1,
+                                userInfo: [
+                                    NSLocalizedDescriptionKey: message
+                                ]
+                            )
+                        }
+
+                        do {
+                            // Recheck every critical condition after
+                            // the user confirms the operation.
+                            guard root.path ==
+                                    root.resolvingSymlinksInPath().path,
+                                  installed.path ==
+                                    installed.resolvingSymlinksInPath().path,
+                                  parked.path ==
+                                    parked.resolvingSymlinksInPath().path,
+                                  let installedAttributes =
+                                    try? fm.attributesOfItem(
+                                        atPath: installed.path
+                                    ),
+                                  installedAttributes[.type] as?
+                                    FileAttributeType == .typeDirectory,
+                                  let parkedAttributes =
+                                    try? fm.attributesOfItem(
+                                        atPath: parked.path
+                                    ),
+                                  parkedAttributes[.type] as?
+                                    FileAttributeType == .typeDirectory,
+                                  verifiedVersion(installed) == nil,
+                                  verifiedVersion(parked) == originalVersion else {
+                                throw recoveryError(
+                                    "Recovery preflight failed. No files moved."
+                                )
+                            }
+
+                            let currentNames = try fm.contentsOfDirectory(
+                                atPath: root.path
+                            )
+
+                            let currentParked = currentNames.filter {
+                                $0.hasPrefix(prefix) &&
+                                $0.hasSuffix(".app")
+                            }
+
+                            let currentIncoming = currentNames.filter {
+                                $0.hasPrefix(".MacBox-86Box-incoming-") &&
+                                $0.hasSuffix(".app")
+                            }
+
+                            guard currentParked == [name],
+                                  currentIncoming.isEmpty else {
+                                throw recoveryError(
+                                    "Transaction state changed. No files moved."
+                                )
+                            }
+
+                            let quarantine = root.appendingPathComponent(
+                                "86Box-recovery-quarantine",
+                                isDirectory: true
+                            )
+
+                            if !fm.fileExists(atPath: quarantine.path) {
+                                guard (try? fm.destinationOfSymbolicLink(
+                                    atPath: quarantine.path
+                                )) == nil else {
+                                    throw recoveryError(
+                                        "Quarantine path is a symbolic link."
+                                    )
+                                }
+
+                                try fm.createDirectory(
+                                    at: quarantine,
+                                    withIntermediateDirectories: false
+                                )
+                            }
+
+                            guard quarantine.path ==
+                                    quarantine.resolvingSymlinksInPath().path,
+                                  let attributes =
+                                    try? fm.attributesOfItem(
+                                        atPath: quarantine.path
+                                    ),
+                                  attributes[.type] as?
+                                    FileAttributeType == .typeDirectory else {
+                                throw recoveryError(
+                                    "Quarantine directory is unsafe."
+                                )
+                            }
+
+                            let destination = quarantine
+                                .appendingPathComponent(
+                                    "86Box-damaged-installed-\(UUID().uuidString).app",
+                                    isDirectory: true
+                                )
+
+                            guard !fm.fileExists(atPath: destination.path),
+                                  (try? fm.destinationOfSymbolicLink(
+                                    atPath: destination.path
+                                  )) == nil else {
+                                throw recoveryError(
+                                    "Quarantine destination already exists."
+                                )
+                            }
+
+                            // Preserve the damaged application.
+                            // Never recursively delete its contents.
+                            try fm.moveItem(
+                                at: installed,
+                                to: destination
+                            )
+
+                            guard fm.fileExists(atPath: destination.path),
+                                  !fm.fileExists(atPath: installed.path),
+                                  verifiedVersion(parked) ==
+                                    originalVersion else {
+                                throw recoveryError(
+                                    "Damaged application quarantined, but " +
+                                    "restoration requires manual review."
+                                )
+                            }
+
+                            // Restore the independently verified
+                            // previous application.
+                            try fm.moveItem(
+                                at: parked,
+                                to: installed
+                            )
+
+                            guard verifiedVersion(installed) ==
+                                    originalVersion,
+                                  !fm.fileExists(atPath: parked.path) else {
+                                throw recoveryError(
+                                    "Restoration requires manual verification."
+                                )
+                            }
+
+                            let success = NSAlert()
+                            success.alertStyle = .informational
+                            success.messageText =
+                                "86Box recovery completed"
+                            success.informativeText = """
+                            Restored version: \(originalVersion)
+
+                            The damaged application has been preserved at:
+
+                            \(destination.path)
+
+                            The damaged application has been preserved in quarantine.
+                            """
+                            success.addButton(withTitle: "OK")
+                            success.runModal()
+
+                        } catch {
+                            let failure = NSAlert()
+                            failure.alertStyle = .critical
+                            failure.messageText =
+                                "Recovery requires manual review"
+                            failure.informativeText = """
+                            \(error.localizedDescription)
+
+                            No files will be automatically deleted or overwritten.
+
+                            Inspect the recovery directories before attempting recovery again.
+                            """
+                            failure.addButton(withTitle: "OK")
+                            failure.runModal()
+                        }
+                    }
+
+                    return
+                }
+
+
+                let canArchive = verifiedVersion(installed).map {
+                    $0.compare(
+                        originalVersion,
+                        options: .numeric
+                    ) == .orderedDescending
+                } ?? false
+
+                DispatchQueue.main.async {
+                    let alert = NSAlert()
+                    alert.alertStyle = .warning
+                    alert.messageText =
+                        "Interrupted 86Box update detected"
+                    alert.informativeText = message
+
+                    if canArchive {
+                        alert.addButton(
+                            withTitle: "Keep installed and archive previous"
+                        )
+                        alert.addButton(withTitle: "Leave unchanged")
+                    } else {
+                        alert.addButton(withTitle: "OK")
+                    }
+
+                    let response = alert.runModal()
+
+                    guard canArchive,
+                          response == .alertFirstButtonReturn else {
+                        return
+                    }
+
+                    do {
+                        func recoveryError(_ text: String) -> NSError {
+                            NSError(
+                                domain: "MacBoxReleaseTest.Recovery",
+                                code: 1,
+                                userInfo: [
+                                    NSLocalizedDescriptionKey: text
+                                ]
+                            )
+                        }
+
+                        // Revalidate both applications immediately
+                        // before making any filesystem changes.
+                        guard let current = verifiedVersion(installed),
+                              current.compare(
+                                originalVersion,
+                                options: .numeric
+                              ) == .orderedDescending,
+                              verifiedVersion(parked) == originalVersion else {
+                            throw recoveryError(
+                                "Application verification changed. " +
+                                "No recovery files have been removed."
+                            )
+                        }
+
+                        let names = try fm.contentsOfDirectory(
+                            atPath: root.path
+                        )
+
+                        let parkedNames = names.filter {
+                            $0.hasPrefix(prefix) &&
+                            $0.hasSuffix(".app")
+                        }
+
+                        let incomingNames = names.filter {
+                            $0.hasPrefix(".MacBox-86Box-incoming-") &&
+                            $0.hasSuffix(".app")
+                        }
+
+                        guard parkedNames.count == 1,
+                              parkedNames[0] == name,
+                              incomingNames.isEmpty else {
+                            throw recoveryError(
+                                "Additional transaction files were found. " +
+                                "Manual review is required."
+                            )
+                        }
+
+                        let backups = root.appendingPathComponent(
+                            "86Box-backups",
+                            isDirectory: true
+                        )
+
+                        // The backup directory must already exist
+                        // and must not redirect through a symlink.
+                        guard backups.standardizedFileURL.path ==
+                                backups.resolvingSymlinksInPath()
+                                    .standardizedFileURL.path,
+                              let attributes = try? fm.attributesOfItem(
+                                atPath: backups.path
+                              ),
+                              attributes[.type] as? FileAttributeType ==
+                                .typeDirectory else {
+                            throw recoveryError(
+                                "The backup directory is missing or unsafe."
+                            )
+                        }
+
+                        // Use a distinct name so existing automatic
+                        // backups are never overwritten.
+                        let archive = backups.appendingPathComponent(
+                            "86Box-recovered-\(identifier).app",
+                            isDirectory: true
+                        )
+
+                        guard !fm.fileExists(atPath: archive.path),
+                              (try? fm.destinationOfSymbolicLink(
+                                atPath: archive.path
+                              )) == nil else {
+                            throw recoveryError(
+                                "The recovery archive already exists."
+                            )
+                        }
+
+                        // Preserve the parked application before
+                        // removing anything from its original location.
+                        try fm.copyItem(at: parked, to: archive)
+
+                        guard verifiedVersion(archive) ==
+                                originalVersion else {
+                            throw recoveryError(
+                                "The archived application failed verification. " +
+                                "The parked application has been preserved."
+                            )
+                        }
+
+                        // The backup is verified. Remove the parked copy
+                        // to resolve the interrupted transaction.
+                        try fm.removeItem(at: parked)
+
+                        NSLog(
+                            "MacBoxReleaseTest: Previous 86Box archived at %@",
+                            archive.path
+                        )
+
+                        let success = NSAlert()
+                        success.alertStyle = .informational
+                        success.messageText =
+                            "86Box recovery completed"
+                        success.informativeText = """
+                        Installed version: \(current)
+                        Archived version: \(originalVersion)
+
+                        The previous emulator has been safely archived at:
+
+                        \(archive.path)
+
+                        Future updates are no longer blocked by this interrupted transaction.
+                        """
+                        success.addButton(withTitle: "OK")
+                        success.runModal()
+
+                    } catch {
+                        NSLog(
+                            "MacBoxReleaseTest: Recovery failed: %@",
+                            error.localizedDescription
+                        )
+
+                        let failure = NSAlert()
+                        failure.alertStyle = .critical
+                        failure.messageText =
+                            "86Box recovery could not be completed"
+                        failure.informativeText = """
+                        \(error.localizedDescription)
+
+                        The recovery process has not deliberately
+                        removed an unverified application.
+
+                        Please review the installation and backup
+                        directories before trying again.
+                        """
+                        failure.addButton(withTitle: "OK")
+                        failure.runModal()
+                    }
+                }
+
+                return
+            }
+
+            // The normal installation is missing.
+            // Restore the verified parked application.
+            do {
+                try fm.moveItem(at: parked, to: installed)
+
+                guard verifiedVersion(installed) == originalVersion else {
+                    // Attempt to return the application to its parked path.
+                    try fm.moveItem(at: installed, to: parked)
+                    NSLog("MacBoxReleaseTest: Restoration verification failed.")
+                    return
+                }
+
+                NSLog(
+                    "MacBoxReleaseTest: Recovered 86Box version %@",
+                    originalVersion
+                )
+            } catch {
+                NSLog(
+                    "MacBoxReleaseTest: Automatic recovery failed: %@",
+                    error.localizedDescription
+                )
+            }
+        }
+        #endif
+
+        // Set 86Box default path
+        private func setEmulatorDefaultPath() {
+
+        #if MACBOX_RELEASE_TEST
+        versionInfoObject.emulatorCustomUrl = fileManager.homeDirectoryForCurrentUser
+            .appendingPathComponent("MacBox-ReleaseTest/86Box.app")
+        return
+        #endif
         if let defaultPath = userDefaults.string(forKey: "emulatorDefaultPath") {
             if defaultPath != "auto" {
                 if #available(macOS 13.0, *) {
@@ -133,14 +1221,14 @@ class MainViewController: NSViewController {
             }
         }
     }
-    
+
     // Set 86Box update channel
     private func setEmulatorUpdateChannel() {
         if let updateChannel = userDefaults.string(forKey: "emulatorUpdateChannel") {
             versionInfoObject.emulatorUpdateChannel = updateChannel
         }
     }
-    
+
     // Config views initial properties
     private func configView() {
         spinningProgressIndicator.startAnimation(self)
@@ -156,7 +1244,7 @@ class MainViewController: NSViewController {
         let menu = NSMenu()
         menu.delegate = self
         vmsTableView.menu = menu
-        
+
         // Add double click for table view cells
         vmsTableView.doubleAction = #selector(tableViewDoubleClickAction(_:))
     }
@@ -177,17 +1265,31 @@ class MainViewController: NSViewController {
         vmSpecHDD.stringValue = "-"
         vmSpecMachineLogo.image = nil
     }
-    
+
     // Set MacBox home directory path
     private func setHomeDir() {
+        #if MACBOX_RELEASE_TEST
+        homeDirURL = URL(
+            fileURLWithPath: "MacBox-ReleaseTest",
+            isDirectory: true,
+            relativeTo: fileManager.homeDirectoryForCurrentUser
+        )
+        #elseif DEBUG
+        // Development builds must always use isolated storage.
+        homeDirURL = URL(
+            fileURLWithPath: "MacBox-Dev",
+            isDirectory: true,
+            relativeTo: fileManager.homeDirectoryForCurrentUser
+        )
+        #else
         if let homeDirPath = userDefaults.string(forKey: "homeDirPath") {
             if #available(macOS 13.0, *) {
                 homeDirURL = URL(filePath: homeDirPath)
             } else {
-                // Fallback on earlier versions
                 homeDirURL = URL(fileURLWithPath: homeDirPath)
             }
         }
+        #endif
     }
 
     // Initialize MacBox directory and config files
@@ -198,11 +1300,11 @@ class MainViewController: NSViewController {
         } catch {
             print("Error: \(error.localizedDescription)")
         }
-        
+
         // Initialize the config file
         initConfigFile()
     }
-    
+
     // Initialize MacBox config file
     private func initConfigFile() {
         var configFileURL = homeDirURL
@@ -218,7 +1320,7 @@ class MainViewController: NSViewController {
         else {
             readConfigFile()
         }
-        
+
         // Restore last selected vm
         let lastSelectedVM = userDefaults.integer(forKey: "lastSelectedVM")
         if lastSelectedVM >= 0 && lastSelectedVM < vmList.count {
@@ -228,12 +1330,12 @@ class MainViewController: NSViewController {
             selectTableRow(row: lastSelectedVM)
         }
     }
-    
+
     // Write the MacBox config file
     private func writeConfigFile() {
         var configStr = ""
         let jsonEncoder = JSONEncoder()
-        
+
         // Encode VM list as JSON data
         do{
             let jsonResultData = try jsonEncoder.encode(vmList)
@@ -241,7 +1343,7 @@ class MainViewController: NSViewController {
         } catch {
             print("Error: \(error.localizedDescription)")
         }
-        
+
         // Write data to the Config file
         if #available(macOS 13.0, *) {
             let configFileURL = homeDirURL.appending(component: "Config")
@@ -260,7 +1362,7 @@ class MainViewController: NSViewController {
             }
         }
     }
-    
+
     // Read from the MacBox config file
     private func readConfigFile() {
         var configFileURL: URL?
@@ -270,13 +1372,13 @@ class MainViewController: NSViewController {
             // Fallback on earlier versions
             configFileURL = homeDirURL.appendingPathComponent("Config")
         }
-        
+
         // Decode JSON data and add it to the vmList
         do {
             let jsonData = try Data(contentsOf: configFileURL ?? URL(fileURLWithPath: ""))
             let jsonDecoder = JSONDecoder()
             let vms = try jsonDecoder.decode([VM].self, from: jsonData)
-            
+
             for vm in vms {
                 addVM(vm: vm)
             }
@@ -284,7 +1386,7 @@ class MainViewController: NSViewController {
             print("Error: \(error.localizedDescription)")
         }
     }
-    
+
     // Update the config file for custom HomeDir path
     func updateConfigFile(previousLocation: URL, newLocation: URL) {
         for vm in vmList {
@@ -303,37 +1405,39 @@ class MainViewController: NSViewController {
         // Recheck for MacBox in-case it was moved with the home directory
         checkFor86Box(url: nil, appVer: nil, buildVer: nil, ignoreVersionCheck: true)
     }
-    
+
     // Check if 86Box is installed, and check for updated version
     func checkFor86Box(url: URL? = nil, appVer: String? = nil, buildVer: String? = nil, ignoreVersionCheck: Bool = false) {
         var localUrl: URL?
-        
+
         if let url = url {
             // Updated 86Box app url
             localUrl = url
             versionInfoObject.emulatorAutoUrl = url
-            
+
             if let appVer = appVer {
                 emulatorAppVer = appVer
             }
-            
+
             if let buildVer = buildVer {
                 emulatorBuildVer = buildVer
             }
         }
         else {
-            // Check if 86Box app is installed
+            // Only discover globally registered 86Box in Release builds.
+            // Development builds must not select the production emulator.
+            #if !DEBUG && !MACBOX_RELEASE_TEST
             if let bundleURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "net.86Box.86Box") {
-                // Save 86Box emulator URL
                 versionInfoObject.emulatorAutoUrl = bundleURL
                 localUrl = bundleURL
             }
-            
+            #endif
+
             // Check if there's a custom 86Box path set
             if versionInfoObject.emulatorCustomUrl != nil {
                 localUrl = versionInfoObject.emulatorCustomUrl
             }
-            
+
             if let localUrl = localUrl, !ignoreVersionCheck {
                 // Get 86Box info.plist
                 if let bundle = Bundle(url: localUrl) {
@@ -343,17 +1447,24 @@ class MainViewController: NSViewController {
                     }
                     // Get the 86Box bundle version
                     if let bundleVersion = bundle.infoDictionary?["CFBundleVersion"] as? String {
-                        emulatorBuildVer = String((bundleVersion).suffix(4))
+                        // 86Box build numbers can contain more than four digits.
+                        // Read the complete final version component.
+                        emulatorBuildVer = bundleVersion.components(separatedBy: ".").last ?? bundleVersion
                     }
                 }
             }
         }
-        
+
         fetchLatestOnlineBuildNumbers()
     }
-    
+
     // Check all possible locations for 86Box ROMs
     func checkForRoms() {
+        #if DEBUG || MACBOX_RELEASE_TEST
+        NSLog("MacBoxDev: global ROM discovery disabled.")
+        return
+        #endif
+
         // Check location related to VMs
         for vm in vmList {
             if let vmPath = vm.path {
@@ -369,7 +1480,7 @@ class MainViewController: NSViewController {
                 }
             }
         }
-        
+
         // Check location related to 86Box
         if let emulatorAutoPath = versionInfoObject.emulatorAutoUrl?.relativePath {
             let romsDirPath = emulatorAutoPath + "/roms"
@@ -383,7 +1494,7 @@ class MainViewController: NSViewController {
                 }
             }
         }
-        
+
         if let emulatorCustomPath = versionInfoObject.emulatorCustomUrl?.relativePath {
             let romsDirPath = emulatorCustomPath + "/roms"
             var isDirectory : ObjCBool = false
@@ -396,36 +1507,56 @@ class MainViewController: NSViewController {
                 }
             }
         }
-        
+
         // Check location related to system library
         let appSupportDir = fileManager.urls(for: .applicationSupportDirectory, in: [.userDomainMask, .systemDomainMask])
         for dir in appSupportDir {
-            let romsDirPath = dir.relativePath + "/net.86box.86Box/roms"
-            var isDirectory : ObjCBool = false
-            if fileManager.fileExists(atPath: romsDirPath, isDirectory: &isDirectory) {
-                if isDirectory.boolValue {
-                    // ROMs directory exists; Check if it's not empty
-                    if fileManager.sizeOfDirectory(atPath: romsDirPath) != 0 {
-                        versionInfoObject.romsUrls.append(URL(fileURLWithPath: romsDirPath))
-                    }
+            for relativePath in [
+                "86Box/roms",
+                "net.86box.86Box/roms"
+            ] {
+                let romsURL = dir.appendingPathComponent(
+                    relativePath,
+                    isDirectory: true
+                )
+
+                guard romsURL.path ==
+                        romsURL.resolvingSymlinksInPath().path
+                else {
+                    continue
+                }
+
+                var isDirectory: ObjCBool = false
+
+                if fileManager.fileExists(
+                    atPath: romsURL.path,
+                    isDirectory: &isDirectory
+                ),
+                   isDirectory.boolValue,
+                   fileManager.sizeOfDirectory(
+                    atPath: romsURL.path
+                   ) != 0,
+                   !versionInfoObject.romsUrls.contains(romsURL) {
+
+                    versionInfoObject.romsUrls.append(romsURL)
                 }
             }
         }
     }
-    
+
     // Fetch the latest 86Box build version, ROMs and MacBox version
     private func fetchLatestOnlineBuildNumbers() {
         numberOfUpdates = 0
-        
+
         // Check for internet connection
         let monitor = NWPathMonitor()
         let queue = DispatchQueue(label: "InternetConnectionMonitor")
-        
+
         monitor.pathUpdateHandler = { pathUpdateHandler in
             if pathUpdateHandler.status == .satisfied {
                 // Cancel the NWPathMonitor as it's not needed any longer
                 monitor.cancel()
-                
+
                 // We're online, fetch 86Box build version from update channel
                 if self.versionInfoObject.emulatorUpdateChannel == "stable" {
                     // Stable: from GitHub
@@ -442,24 +1573,24 @@ class MainViewController: NSViewController {
                 self.updateVersionStatus()
             }
         }
-        
+
         monitor.start(queue: queue)
     }
-    
+
     // Fetch 86Box update info from Jenkins
     private func fetchEmulatorUpdateInfoFromJenkins() {
         if let url = URL(string: "https://ci.86box.net/job/86Box/lastStableBuild/api/json") {
             var request = URLRequest(url: url)
             request.httpMethod = "GET"
-            
+
             let task = URLSession.shared.dataTask(with: url) {(data, response, error) in
                 guard let data = data else { return }
-                
+
                 do {
                     // Try getting the 86Box update info from Jenkins
                     let jenkinsJsonResponse = try JSONDecoder().decode(JenkinsResponseObject.self, from: data)
                     self.versionInfoObject.emulatorUpdateObject = jenkinsJsonResponse.toGithubResponseObject()
-                    
+
                     // Set status label
                     if let jenkinsBuildVer = jenkinsJsonResponse.number {
                         self.emulatorOnlineVer = String(jenkinsBuildVer)
@@ -471,7 +1602,7 @@ class MainViewController: NSViewController {
                     else {
                         self.emulatorOnlineVer = "0"
                     }
-                    
+
                     // Check for latest 86Box ROMs
                     self.fetchEmulatorRomsUpdateInfo()
                 } catch {
@@ -486,7 +1617,7 @@ class MainViewController: NSViewController {
             task.resume()
         }
     }
-    
+
     // Fetch 86Box update info from GitHub
     private func fetchEmulatorUpdateInfoFromGitHub() {
         if let url = URL(string: "https://api.github.com/repos/86Box/86Box/releases/latest") {
@@ -494,15 +1625,15 @@ class MainViewController: NSViewController {
             request.httpMethod = "GET"
             request.setValue(httpHeaderAcceptValue, forHTTPHeaderField: "Accept")
             request.setValue(httpHeaderContentTypeValue, forHTTPHeaderField: "Content-Type")
-            
+
             let task = URLSession.shared.dataTask(with: request) {(data, response, error) in
                 guard let data = data else { return }
-                
+
                 do {
                     // Try getting the MacBox repo info from GitHub
                     let githubJsonResponse = try JSONDecoder().decode(GithubResponseObject.self, from: data)
                     self.versionInfoObject.emulatorUpdateObject = githubJsonResponse
-                    
+
                     if let githubBuildVer = githubJsonResponse.tag_name {
                         if githubBuildVer.hasPrefix("v") {
                             self.emulatorOnlineVer = String(githubBuildVer.dropFirst())
@@ -518,7 +1649,7 @@ class MainViewController: NSViewController {
                     else {
                         self.emulatorOnlineVer = "0"
                     }
-                    
+
                     // Check for latest 86Box ROMs
                     self.fetchEmulatorRomsUpdateInfo()
                 } catch {
@@ -529,7 +1660,7 @@ class MainViewController: NSViewController {
             task.resume()
         }
     }
-    
+
     // Fetch 86Box ROMs update info from GitHub
     private func fetchEmulatorRomsUpdateInfo() {
         if let url = URL(string: "https://api.github.com/repos/86Box/roms/commits/master") {
@@ -537,15 +1668,15 @@ class MainViewController: NSViewController {
             request.httpMethod = "GET"
             request.setValue(httpHeaderAcceptValue, forHTTPHeaderField: "Accept")
             request.setValue(httpHeaderContentTypeValue, forHTTPHeaderField: "Content-Type")
-            
+
             let task = URLSession.shared.dataTask(with: request) {(data, response, error) in
                 guard let data = data else { return }
-                
+
                 do {
                     // Try getting the 86Box ROMs repo info from GitHub
                     let githubJsonResponse = try JSONDecoder().decode(GithubResponseObject.self, from: data)
                     self.versionInfoObject.romsUpdateObject = githubJsonResponse
-                    
+
                     // Compare versions
                     if let latestShaVersion = githubJsonResponse.sha {
                         if let localShaVersion = self.userDefaults.string(forKey: "romsShaVersion") {
@@ -559,7 +1690,7 @@ class MainViewController: NSViewController {
                             self.numberOfUpdates += 1
                         }
                     }
-                    
+
                     // Check for latest MacBox github version
                     self.fetchMacBoxUpdateInfo()
                 } catch {
@@ -569,43 +1700,96 @@ class MainViewController: NSViewController {
             task.resume()
         }
     }
-    
-    // Fetch MacBox update info from GitHub
+
+    // Fetch MacBox releases from our maintained fork.
     private func fetchMacBoxUpdateInfo() {
-        if let url = URL(string: "https://api.github.com/repos/Moonif/MacBox/releases/latest") {
-            var request = URLRequest(url: url)
-            request.httpMethod = "GET"
-            request.setValue(httpHeaderAcceptValue, forHTTPHeaderField: "Accept")
-            request.setValue(httpHeaderContentTypeValue, forHTTPHeaderField: "Content-Type")
-            
-            let task = URLSession.shared.dataTask(with: request) {(data, response, error) in
-                guard let data = data else { return }
-                
-                do {
-                    // Try getting the MacBox repo info from GitHub
-                    let githubJsonResponse = try JSONDecoder().decode(GithubResponseObject.self, from: data)
-                    self.versionInfoObject.macboxUpdateObject = githubJsonResponse
-                    
-                    // Compare versions
-                    if let latestTagVersion = githubJsonResponse.tag_name {
-                        let localBuildVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? String(latestTagVersion)
-                        
-                        if localBuildVersion != String(latestTagVersion) {
-                            // New version found
-                            self.numberOfUpdates += 1
-                        }
-                    }
-                    
-                    // Update the version status
-                    self.updateVersionStatus()
-                } catch {
-                    print("Error: \(error.localizedDescription)")
-                }
-            }
-            task.resume()
+
+        guard let url = URL(
+            string: "https://api.github.com/repos/settloe99/MacBox/releases/latest"
+        ) else {
+            return
         }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue(
+            httpHeaderAcceptValue,
+            forHTTPHeaderField: "Accept"
+        )
+        request.setValue(
+            httpHeaderContentTypeValue,
+            forHTTPHeaderField: "Content-Type"
+        )
+
+        let task = URLSession.shared.dataTask(
+            with: request
+        ) { data, response, error in
+
+            if let error = error {
+                NSLog(
+                    "MacBox: Release check failed: %@",
+                    error.localizedDescription
+                )
+                self.updateVersionStatus()
+                return
+            }
+
+            guard let httpResponse = response as? HTTPURLResponse else {
+                self.updateVersionStatus()
+                return
+            }
+
+            // Our fork has no published release yet.
+            // This is not evidence that an update is available.
+            if httpResponse.statusCode == 404 {
+                self.versionInfoObject.macboxUpdateObject = nil
+                NSLog("MacBox: No published fork release available.")
+                self.updateVersionStatus()
+                return
+            }
+
+            guard httpResponse.statusCode == 200,
+                  let data = data else {
+                NSLog(
+                    "MacBox: Release API returned HTTP %d",
+                    httpResponse.statusCode
+                )
+                self.updateVersionStatus()
+                return
+            }
+
+            do {
+                let release = try JSONDecoder().decode(
+                    GithubResponseObject.self,
+                    from: data
+                )
+
+                self.versionInfoObject.macboxUpdateObject = release
+
+                if let latestVersion = release.tag_name {
+                    let installedVersion = Bundle.main.object(
+                        forInfoDictionaryKey: "CFBundleShortVersionString"
+                    ) as? String
+
+                    if let installedVersion = installedVersion,
+                       installedVersion != latestVersion {
+                        self.numberOfUpdates += 1
+                    }
+                }
+
+            } catch {
+                NSLog(
+                    "MacBox: Cannot decode fork release: %@",
+                    error.localizedDescription
+                )
+            }
+
+            self.updateVersionStatus()
+        }
+
+        task.resume()
     }
-    
+
     // Update the version status
     private func updateVersionStatus () {
         DispatchQueue.main.async {
@@ -613,19 +1797,19 @@ class MainViewController: NSViewController {
             self.statusCheckMarkImage.isHidden = true
             self.statusXMarkImage.isHidden = true
             self.statusExclamationMarkImage.isHidden = true
-            
+
             // Enable version manager when online
             if self.emulatorOnlineVer != "0" {
                 self.statusArrowImage.isHidden = false
                 self.statusButton.isEnabled = true
             }
-            
+
             // Check for local build
             if self.emulatorBuildVer == ".0.0" {
                 self.statusLabel.stringValue = String(format: NSLocalizedString("86Box v%@ (Local Build)", comment: ""), self.emulatorAppVer)
                 return
             }
-            
+
             // Set version status
             let updateString = self.numberOfUpdates == 1 ? NSLocalizedString("update", comment: "") : NSLocalizedString("updates", comment: "")
             if self.emulatorBuildVer != "0" {
@@ -649,7 +1833,7 @@ class MainViewController: NSViewController {
                 self.statusLabel.stringValue = NSLocalizedString("86Box is not installed.", comment: "")
                 self.statusXMarkImage.isHidden = false
             }
-            
+
             // Set status color to red when 86Box is not installed
             if self.versionInfoObject.emulatorAutoUrl == nil && self.versionInfoObject.emulatorCustomUrl == nil {
                 self.statusLabel.textColor = .systemRed
@@ -659,12 +1843,17 @@ class MainViewController: NSViewController {
             }
         }
     }
-    
+
     // Add VM to the table view
     func addVM(vm: VM, vmTemplate: VMTemplate? = nil) {
+        #if DEBUG || MACBOX_RELEASE_TEST
+        NSLog("MacBoxDev: VM creation and import disabled during isolation testing.")
+        return
+        #endif
+
         // Make sure vm has a path
         var fixedVM = vm
-        
+
         if vm.path == nil {
             var defaultPath = homeDirURL
             if #available(macOS 13.0, *) {
@@ -673,22 +1862,22 @@ class MainViewController: NSViewController {
                 // Fallback on earlier versions
                 defaultPath = homeDirURL.appendingPathComponent("\(vm.name?.replacingOccurrences(of: "/", with: "")  ?? "")")
             }
-            
+
             // Check if path was used before
             if fileManager.fileExists(atPath: defaultPath.path) {
                 defaultPath = homeDirURL.appendingPathComponent(UUID().uuidString)
             }
-            
+
             fixedVM.path = defaultPath.path
         }
-        
+
         // Create all VM paths
         setAllVMPaths(vmPath: fixedVM.path ?? "")
-        
+
         // Copy template config file
         if vmTemplate != nil, let templateConfigPath = vmTemplate?.configPath {
             let ini = IniParser()
-            
+
             // Copy config file
             let vmConfigPath = fixedVM.path?.appending("/86box.cfg") ?? ""
             do{
@@ -696,7 +1885,7 @@ class MainViewController: NSViewController {
             } catch {
                 print("Error: \(error.localizedDescription)")
             }
-            
+
             // Copy shader file
             if vmTemplate?.useShader == true {
                 // Get VM template shader path
@@ -732,7 +1921,7 @@ class MainViewController: NSViewController {
                                 } catch {
                                     print("Error: \(error.localizedDescription)")
                                 }
-                                
+
                                 // Write VM config file
                                 if shaderConfigString != "" {
                                     do {
@@ -746,7 +1935,7 @@ class MainViewController: NSViewController {
                     }
                 }
             }
-            
+
             // Create disk if available
             let hddParams = ini.parseConfig(templateConfigPath)["Hard disks"]?["hdd_01_parameters"] ?? ""
             let hddParamsSplit = hddParams.split(separator: ",")
@@ -765,11 +1954,11 @@ class MainViewController: NSViewController {
                 fileManager.createFile(atPath: fixedVM.path?.appending("/disks/hdd.IMG") ?? "", contents: rawData, attributes: nil)
             }
         }
-        
+
         vmList.append(fixedVM)
         vmsTableView.reloadData()
         writeConfigFile()
-        
+
         // Select last added VM
         let lastIndex = vmList.count - 1
         let indexSet = IndexSet(integer: lastIndex)
@@ -777,26 +1966,26 @@ class MainViewController: NSViewController {
         vmsTableView.scrollRowToVisible(lastIndex)
         selectTableRow(row: lastIndex)
     }
-    
+
     // Delete selected VM
     func deleteVM() {
         if currentSelectedVM != nil {
             // Show confirmation alert
             let alert = NSAlert()
-            
+
             alert.messageText = NSLocalizedString("Do you want to remove the selected VM?", comment: "")
             alert.informativeText = NSLocalizedString("This will only remove it from MacBox. If you also want to remove the VM files, check the option below.", comment: "")
             alert.alertStyle = .critical
             alert.addButton(withTitle: NSLocalizedString("Remove", comment: "")).bezelColor = .controlAccentColor
             alert.addButton(withTitle: NSLocalizedString("Cancel", comment: ""))
-            
+
             // Add delete option accessory view
             let deleteOptionButton = NSButton(checkboxWithTitle: NSLocalizedString("Send the selected VM and all its files to trash", comment: ""), target: nil, action: nil)
             alert.accessoryView = deleteOptionButton
-            
+
             // Show the alert
             let alertResult = alert.runModal()
-            
+
             // User pressed the Remove button
             if alertResult == .alertFirstButtonReturn {
                 // Send vm files to trash
@@ -825,7 +2014,7 @@ class MainViewController: NSViewController {
                         }
                     }
                 }
-                
+
                 // Remove vm from list
                 vmList.remove(at: currentSelectedVM!)
                 vmsTableView.reloadData()
@@ -833,35 +2022,35 @@ class MainViewController: NSViewController {
             }
         }
     }
-    
+
     // Copy the selected VM
     private func copyVM(row: Int) {
         let vmPathURL = URL(fileURLWithPath: vmList[row].path ?? "")
-        
+
         // VM copy path
         var vmCopyPathURL = URL(string: "")
         let copyString: String = "(Copy)"
-        
+
         if #available(macOS 13.0, *) {
             vmCopyPathURL = homeDirURL.appending(component: vmPathURL.lastPathComponent + copyString)
         } else {
             // Fallback on earlier versions
             vmCopyPathURL = homeDirURL.appendingPathComponent(vmPathURL.lastPathComponent + copyString)
         }
-        
+
         if vmCopyPathURL != nil {
             // Check if path was used before
             if fileManager.fileExists(atPath: vmCopyPathURL?.path ?? "") {
                 vmCopyPathURL = homeDirURL.appendingPathComponent(UUID().uuidString)
             }
-            
+
             // Copy the VM folder
             do{
                 try fileManager.copyItem(atPath: vmPathURL.path, toPath: vmCopyPathURL?.path ?? "")
-                
+
                 // Create the VM copy
                 var vm = VM()
-                
+
                 // Set VM properties
                 vm.name = (vmList[row].name ?? "") + copyString
                 vm.description = vmList[row].description
@@ -875,12 +2064,17 @@ class MainViewController: NSViewController {
             }
         }
     }
-    
+
     // Start VM process
     private func startVM(launchSettings: Bool = false) {
+        #if DEBUG || MACBOX_RELEASE_TEST
+        NSLog("MacBoxDev: VM launching disabled during isolation testing.")
+        return
+        #endif
+
         if currentSelectedVM != nil {
             let process = Process()
-            
+
             let vmName = (vmList[currentSelectedVM ?? 0]).name ?? "86Box - MacBoxVM"
             // Set default path for new VMs
             var defaultPath = homeDirURL
@@ -891,40 +2085,98 @@ class MainViewController: NSViewController {
                 defaultPath = homeDirURL.appendingPathComponent("/\(vmName)")
             }
             let vmPath = (vmList[currentSelectedVM ?? 0]).path ?? defaultPath.path
-            
-            // Selected app version
-            var vmAppVersion = "net.86Box.86Box"
-            var vmAppArg = "-b"
-            
-            // Set the emulator path if we already have it
-            if let emulatorCustomPath = versionInfoObject.emulatorCustomUrl?.path {
-                vmAppVersion = emulatorCustomPath
-                vmAppArg = "-a"
-            }
-            else if let emulatorAutoPath = versionInfoObject.emulatorAutoUrl?.path {
-                vmAppVersion = emulatorAutoPath
-                vmAppArg = "-a"
-            }
-            
-            if let customAppPath = vmList[currentSelectedVM ?? 0].appPath {
+
+
+            // Resolve the exact emulator application to launch.
+            // Preserve the existing selection priority:
+            // per-VM custom, MacBox configured, then registered app.
+
+            var selectedEmulatorURL =
+                versionInfoObject.emulatorCustomUrl ??
+                versionInfoObject.emulatorAutoUrl
+
+            if let customAppPath =
+                vmList[currentSelectedVM ?? 0].appPath,
+               !customAppPath.isEmpty {
+
                 if fileManager.fileExists(atPath: customAppPath) {
-                    vmAppVersion = customAppPath
-                    vmAppArg = "-a"
-                }
-                else {
-                    // Custom app version was not found (Probably got moved or deleted)
+                    selectedEmulatorURL = URL(
+                        fileURLWithPath: customAppPath,
+                        isDirectory: true
+                    )
+                } else {
                     let alert = NSAlert()
-                    
-                    alert.messageText = NSLocalizedString("Selected 86Box file is not found. VM will open using default version.", comment: "")
-                    alert.alertStyle = .critical
-                    
+                    alert.alertStyle = .warning
+                    alert.messageText =
+                        "Selected 86Box application not found"
+                    alert.informativeText = """
+                    The custom 86Box application for this VM could not be found.
+
+                    MacBox will try the configured default emulator instead.
+                    """
+                    alert.addButton(withTitle: "OK")
                     alert.runModal()
                 }
             }
-            
+
+            // Resolve a registered emulator only if no explicit
+            // application has been selected.
+            if selectedEmulatorURL == nil {
+                selectedEmulatorURL =
+                    NSWorkspace.shared.urlForApplication(
+                        withBundleIdentifier: "net.86Box.86Box"
+                    )
+            }
+
+            guard let emulatorURL = selectedEmulatorURL else {
+                let alert = NSAlert()
+                alert.alertStyle = .critical
+                alert.messageText = "86Box application not found"
+                alert.informativeText = """
+                MacBox could not locate a usable 86Box application.
+
+                Install 86Box or select its application in MacBox preferences.
+                """
+                alert.addButton(withTitle: "OK")
+                alert.runModal()
+                return
+            }
+
+            // Verify the actual application before launching it.
+            // Do not fall back to a different application if this
+            // selected application fails integrity verification.
+            let vmAppVersion: String
+
+            do {
+                let verified = try EmulatorIntegrity.verify(
+                    emulatorURL
+                )
+                vmAppVersion = verified.url.path
+            } catch {
+                let alert = NSAlert()
+                alert.alertStyle = .critical
+                alert.messageText = "86Box launch blocked"
+                alert.informativeText = """
+                The selected 86Box application failed verification.
+
+                \(emulatorURL.path)
+
+                \(error.localizedDescription)
+
+                No virtual machine has been launched.
+                """
+                alert.addButton(withTitle: "OK")
+                alert.runModal()
+                return
+            }
+
+            // Always launch the verified explicit application path.
+            // Never use -b, which would let macOS choose another app.
+            let vmAppArg = "-a"
+
             // Check fullscreen option
             let vmFullScreen = vmList[currentSelectedVM ?? 0].fullScreen ?? false
-            
+
             // Set process arguments
             let argsString: String = "--args"
             let args:[String] = launchSettings ?
@@ -933,7 +2185,7 @@ class MainViewController: NSViewController {
             ["-n", "-W", vmAppArg,vmAppVersion,argsString,"-P","\(vmPath)","-V",vmName, "-F"] :
             ["-n", "-W", vmAppArg,vmAppVersion,argsString,"-P","\(vmPath)","-V",vmName]
             process.arguments = args
-            
+
             process.executableURL = URL(fileURLWithPath:"/usr/bin/open")
 
             // Run the process
@@ -946,21 +2198,21 @@ class MainViewController: NSViewController {
                 }
                 let lastSelectedRow = currentSelectedVM
                 vmsTableView.reloadData()
-                
+
                 // Re-select previously selected row
                 reselectTableRow(row: lastSelectedRow)
-                
+
                 // Wait for process to end
                 Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { (timer) in
                     if !process.isRunning {
                         // Process is terminated, invalidate timer
                         timer.invalidate()
-                        
+
                         // Clear current running vm
                         self.currentRunningVM.removeAll(where:{ $0.vmProcessID == process.processIdentifier })
-                        
+
                         self.vmsTableView.reloadData()
-                        
+
                         // Re-select previously selected row
                         self.reselectTableRow(row: lastSelectedRow)
                     }
@@ -970,7 +2222,7 @@ class MainViewController: NSViewController {
             }
         }
     }
-    
+
     // Select table row and populate vm info
     private func selectTableRow(row: Int) {
         currentSelectedVM = row
@@ -978,7 +2230,7 @@ class MainViewController: NSViewController {
         vmAppVersionPopUpButton.isEnabled = true
         vmSettingsButton.isEnabled = true
         deleteVMButton.isEnabled = true
-        
+
         // VM properties
         let vmName = vmList[row].name ?? "86Box - MacBoxVM"
         let vmDescription = vmList[row].description ?? ""
@@ -986,14 +2238,14 @@ class MainViewController: NSViewController {
         currentVMPrinterPath = vmPath.appending("/printer")
         currentVMScreenShotsPath = vmPath.appending("/screenshots")
         currentVMConfigPath = vmPath.appending("/86box.cfg")
-        
+
         // Set VM name and description text
         vmNameTextField.stringValue = vmName
         vmDescriptionTextView.string = vmDescription
-        
+
         // Set VM specs
         setVMSpecs()
-        
+
         // Check for custom app path
         if vmList[row].appPath != nil {
             vmAppVersionPopUpButton.selectItem(at: 1)
@@ -1002,22 +2254,22 @@ class MainViewController: NSViewController {
             vmAppVersionPopUpButton.selectItem(at: 0)
         }
         setPopupOptionsMultiselection()
-        
+
         // Set user defaults
         DispatchQueue.main.async {
             self.userDefaults.set(row, forKey: "lastSelectedVM")
         }
     }
-    
+
     // Re-select previously selected row
     private func reselectTableRow(row: Int?) {
         let indexSet = IndexSet(integer: row ?? 0)
-        
+
         vmsTableView.selectRowIndexes(indexSet, byExtendingSelection: false)
         vmsTableView.scrollRowToVisible(row ?? 0)
         selectTableRow(row: row ?? 0)
     }
-    
+
     // Tableview cell 'Show in Finder' action
     @objc private func tableViewFindInFinderAction(_ sender: AnyObject) {
         if vmsTableView.clickedRow >= 0 {
@@ -1025,28 +2277,28 @@ class MainViewController: NSViewController {
             NSWorkspace.shared.open(vmPathURL)
         }
     }
-    
+
     // Tableview cell 'Duplicate' action
     @objc private func tableViewDuplicateAction(_ sender: AnyObject) {
         if vmsTableView.clickedRow >= 0 {
             copyVM(row: vmsTableView.clickedRow)
         }
     }
-    
+
     // Tableview cell double click action
     @objc private func tableViewDoubleClickAction(_ sender: AnyObject) {
         if vmsTableView.clickedRow >= 0 {
             startVM()
         }
     }
-    
+
     // Set all VM paths
     private func setAllVMPaths(vmPath: String) {
         let printerPath = vmPath.appending("/printer")
         let screenshotsPath = vmPath.appending("/screenshots")
         let diskPath = vmPath.appending("/disks")
         let shaderPath = vmPath.appending("/shaders")
-        
+
         // Create printer folder if it doesn't already exist
         if !fileManager.fileExists(atPath: printerPath) {
             do {
@@ -1055,7 +2307,7 @@ class MainViewController: NSViewController {
                 print("Error: \(error.localizedDescription)")
             }
         }
-        
+
         // Create screenshots folder if it doesn't already exist
         if !fileManager.fileExists(atPath: screenshotsPath) {
             do {
@@ -1064,7 +2316,7 @@ class MainViewController: NSViewController {
                 print("Error: \(error.localizedDescription)")
             }
         }
-        
+
         // Create disk folder if it doesn't already exist
         if !fileManager.fileExists(atPath: diskPath) {
             do {
@@ -1073,7 +2325,7 @@ class MainViewController: NSViewController {
                 print("Error: \(error.localizedDescription)")
             }
         }
-        
+
         // Create shader folder if it doesn't already exist
         if !fileManager.fileExists(atPath: shaderPath) {
             do {
@@ -1083,7 +2335,7 @@ class MainViewController: NSViewController {
             }
         }
     }
-    
+
     // Set current VM specs
     private func setVMSpecs() {
         if currentVMConfigPath != nil {
@@ -1096,7 +2348,7 @@ class MainViewController: NSViewController {
                 vmSpecCPU.stringValue = parsedSpecs.cpu
                 vmSpecRAM.stringValue = parsedSpecs.ram
                 vmSpecHDD.stringValue = parsedSpecs.hdd
-                
+
                 // Define machine logo
                 if let machineLogo = vmList[currentSelectedVM ?? 0].logo {
                     vmSpecMachineLogo.image = NSImage(named: machineLogo)
@@ -1135,7 +2387,7 @@ class MainViewController: NSViewController {
             }
         }
     }
-    
+
     // Set the Start button popup options multiselection
     private func setPopupOptionsMultiselection() {
         if let selectedVM = currentSelectedVM {
@@ -1145,7 +2397,7 @@ class MainViewController: NSViewController {
             else {
                 vmAppVersionPopUpButton.selectItem(at: 1)
             }
-            
+
             if vmList[selectedVM].fullScreen != nil && vmList[selectedVM].fullScreen! {
                 vmAppVersionPopUpButton.itemArray[3].state = .on
             }
@@ -1154,72 +2406,72 @@ class MainViewController: NSViewController {
             }
         }
     }
-    
+
 // ------------------------------------
 // IBActions
 // ------------------------------------
-    
+
     // Start VM button action
     @IBAction func startVMButtonAction(_ sender: NSButton) {
         startVM()
     }
-    
+
     // VM settings button action
     @IBAction func vmSettingsButtonAction(_ sender: NSButton) {
         startVM(launchSettings: true)
     }
-    
+
     // Delete VM button action
     @IBAction func deleteVMButtonAction(_ sender: NSButton) {
         deleteVM()
     }
-    
+
     // Add VM toolbar button action
     @IBAction func addVMButtonAction(_ sender: Any) {
         if let addVMTabViewVC = self.storyboard?.instantiateController(withIdentifier: "AddVMVC") as? NSTabViewController {
             self.presentAsModalWindow(addVMTabViewVC)
         }
-        
+
         // Deselect the toolbar button after action
         if let senderButton = sender as? NSToolbarItem {
             senderButton.toolbar?.selectedItemIdentifier = nil
         }
     }
-    
+
     // Print tray toolbar button action
     @IBAction func printTrayButtonAction(_ sender: Any) {
         if currentVMPrinterPath != nil {
             NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: String(currentVMPrinterPath ?? ""))
         }
-        
+
         // Deselect the toolbar button after action
         if let senderButton = sender as? NSToolbarItem {
             senderButton.toolbar?.selectedItemIdentifier = nil
         }
     }
-    
+
     // Screenshots toolbar button action
     @IBAction func screenshotsButtonAction(_ sender: Any) {
         if currentVMScreenShotsPath != nil {
             NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: String(currentVMScreenShotsPath ?? ""))
         }
-        
+
         // Deselect the toolbar button after action
         if let senderButton = sender as? NSToolbarItem {
             senderButton.toolbar?.selectedItemIdentifier = nil
         }
     }
-    
+
     // Settings button action
     @IBAction func showSettingsWindow(_ sender: Any?) {
         self.performSegue(withIdentifier: "showSettingsVC", sender: sender)
     }
-    
+
     // Open the Jenkins url
     @IBAction func versionStatusButtonAction(_ sender: NSButton) {
         self.performSegue(withIdentifier: "showVersionManagerVC", sender: sender)
     }
-    
+
     // Select 86Box version for the selected vm
     @IBAction func vmAppVersionPopUpButtonAction(_ sender: NSPopUpButton) {
         if sender.selectedItem?.identifier == NSUserInterfaceItemIdentifier(rawValue: "defaultAppId") {
@@ -1233,12 +2485,12 @@ class MainViewController: NSViewController {
         else if sender.selectedItem?.identifier == NSUserInterfaceItemIdentifier(rawValue: "customAppId") {
             // Open the file picker
             let filePickerPanel = NSOpenPanel()
-            
+
             filePickerPanel.allowsMultipleSelection = false
             filePickerPanel.canChooseDirectories = false
             filePickerPanel.canChooseFiles = true
             filePickerPanel.allowedFileTypes = ["app"]
-            
+
             if filePickerPanel.runModal() == .OK {
                 if let appURL = filePickerPanel.url {
                     if let selectedVM = currentSelectedVM {
@@ -1266,11 +2518,11 @@ class MainViewController: NSViewController {
                 writeConfigFile()
             }
         }
-        
+
         // Set popup options multiselection
         setPopupOptionsMultiselection()
     }
-    
+
 // ------------------------------------
 // Segue handling
 // ------------------------------------
@@ -1280,7 +2532,7 @@ class MainViewController: NSViewController {
             if let versionManagerVC = segue.destinationController as? VersionManagerViewController {
                 versionManagerVC.emulatorAppVer = emulatorAppVer
                 versionManagerVC.emulatorBuildVer = emulatorBuildVer
-                
+
                 if versionInfoObject.emulatorUpdateChannel == "stable" {
                     versionManagerVC.isStableChannel = true
                 }
@@ -1293,12 +2545,12 @@ class MainViewController: NSViewController {
 // VM TableView Delegate and Datasource
 // ------------------------------------
 extension MainViewController: NSTableViewDelegate, NSTableViewDataSource {
-    
+
     // Return number of cells for vm table view
     func numberOfRows(in tableView: NSTableView) -> Int {
         return vmList.count
     }
-    
+
     // Populate cells based on vmList data
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         let vmObject = vmList[row]
@@ -1314,25 +2566,25 @@ extension MainViewController: NSTableViewDelegate, NSTableViewDataSource {
         }
         return cell
     }
-    
+
     // Handle cells selection
     func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool {
         selectTableRow(row: row)
-        
+
         return true
     }
-    
+
     // Set drag and drop for table cells
     func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
         let indexSet = IndexSet(integer: row)
         vmsTableView.selectRowIndexes(indexSet, byExtendingSelection: false)
         selectTableRow(row: row)
-        
+
         let item = NSPasteboardItem()
         item.setString(String(row), forType: self.dragDropType)
         return item
     }
-    
+
     // Validate drag and drop behavior
     func tableView(_ tableView: NSTableView, validateDrop info: NSDraggingInfo, proposedRow row: Int, proposedDropOperation dropOperation: NSTableView.DropOperation) -> NSDragOperation {
         if dropOperation == .above {
@@ -1340,7 +2592,7 @@ extension MainViewController: NSTableViewDelegate, NSTableViewDataSource {
         }
         return []
     }
-    
+
     // Handle post drag and drop behavior
     func tableView(_ tableView: NSTableView, acceptDrop info: NSDraggingInfo, row: Int, dropOperation: NSTableView.DropOperation) -> Bool {
         var oldIndexes = [Int]()
@@ -1349,10 +2601,10 @@ extension MainViewController: NSTableViewDelegate, NSTableViewDataSource {
                 oldIndexes.append(index)
             }
         }
-        
+
         var oldIndexOffset = 0
         var newIndexOffset = 0
-        
+
         // Update table view cells and vmlist data
         tableView.beginUpdates()
         for oldIndex in oldIndexes {
@@ -1376,13 +2628,13 @@ extension MainViewController: NSTableViewDelegate, NSTableViewDataSource {
             }
         }
         tableView.endUpdates()
-        
+
         // Update config file
         writeConfigFile()
-        
+
         return true
     }
-    
+
     // Disable events for table view
     func tableView(_ tableView: NSTableView, shouldTypeSelectFor event: NSEvent, withCurrentSearch searchString: String?) -> Bool {
         return false
@@ -1411,7 +2663,7 @@ extension MainViewController: NSTextFieldDelegate {
             }
         }
     }
-    
+
     func controlTextDidEndEditing(_ obj: Notification) {
         if let textField = obj.object as? NSTextField {
             if textField.identifier == NSUserInterfaceItemIdentifier(rawValue: "vmNameID") {
@@ -1454,7 +2706,7 @@ extension MainViewController: NSTextViewDelegate {
 extension MainViewController: NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
-        
+
         if vmsTableView.clickedRow >= 0 {
             // Right-Clicked on a VM cell
             menu.addItem(NSMenuItem(title: NSLocalizedString("Show in Finder", comment: ""), action: #selector(tableViewFindInFinderAction(_:)), keyEquivalent: ""))

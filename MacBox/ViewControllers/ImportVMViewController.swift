@@ -59,6 +59,11 @@ class ImportVMViewController: NSViewController {
     
     // Find 86Box config files
     private func findConfigFiles() {
+        #if MACBOX_RELEASE_TEST
+        cancelSearch = true
+        spinningProgressIndicator.stopAnimation(self)
+        return
+        #endif
         // Clear the config files list
         configFilesList.removeAll()
         configFilesTableView.reloadData()
