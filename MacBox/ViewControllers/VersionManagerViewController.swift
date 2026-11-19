@@ -2416,35 +2416,311 @@ class VersionManagerViewController: NSViewController {
         #endif
     }
 
-    // Handle a downloaded MacBox application update.
-    // Production installation remains disabled until the
-    // authenticated external updater workflow is connected.
+    // Prepare an already verified MacBox ZIP for the external
+    // updater. Extraction is isolated from the installed app.
+    private func prepareStagedMacBoxApplication(
+        from downloadedZIP: URL
+    ) throws -> URL {
+
+        let fm = FileManager.default
+
+        func fail(_ message: String) -> NSError {
+            NSError(
+                domain: "MacBox.SelfUpdater",
+                code: 5,
+                userInfo: [
+                    NSLocalizedDescriptionKey: message
+                ]
+            )
+        }
+
+        guard let caches = fm.urls(
+            for: .cachesDirectory,
+            in: .userDomainMask
+        ).first?.standardizedFileURL else {
+            throw fail("User cache directory unavailable.")
+        }
+
+        let stagingRoot = caches.appendingPathComponent(
+            "io.github.settloe99.MacBox/StagedUpdates",
+            isDirectory: true
+        ).standardizedFileURL
+
+        let archive = downloadedZIP.standardizedFileURL
+
+        // Only accept an ordinary ZIP file previously staged
+        // by our verified download workflow.
+        guard archive.deletingLastPathComponent() == stagingRoot,
+              archive.pathExtension.lowercased() == "zip",
+              archive.path == archive.resolvingSymlinksInPath().path,
+              stagingRoot.path ==
+                stagingRoot.resolvingSymlinksInPath().path,
+              let rootAttributes = try? fm.attributesOfItem(
+                atPath: stagingRoot.path
+              ),
+              rootAttributes[.type] as? FileAttributeType ==
+                .typeDirectory,
+              let archiveAttributes = try? fm.attributesOfItem(
+                atPath: archive.path
+              ),
+              archiveAttributes[.type] as? FileAttributeType ==
+                .typeRegular else {
+
+            throw fail("Unsafe or missing staged MacBox archive.")
+        }
+
+        // Validate ZIP contents before extracting.
+        try validateMacBoxUpdateArchive(at: archive)
+
+        let identifier = UUID().uuidString
+
+        let extractionRoot = stagingRoot.appendingPathComponent(
+            identifier,
+            isDirectory: true
+        )
+
+        let application = extractionRoot.appendingPathComponent(
+            "MacBox.app",
+            isDirectory: true
+        )
+
+        try fm.createDirectory(
+            at: extractionRoot,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+
+        do {
+            // Extract only into the private staging directory.
+            try fm.unzipItem(
+                at: archive,
+                to: extractionRoot
+            )
+
+            // Validate the extracted application's identity.
+            guard application.path ==
+                    application.resolvingSymlinksInPath().path,
+                  let bundle = Bundle(url: application),
+                  bundle.bundleIdentifier ==
+                    "io.github.settloe99.MacBox",
+                  bundle.object(
+                    forInfoDictionaryKey: "CFBundleExecutable"
+                  ) as? String == "MacBox" else {
+
+                throw fail(
+                    "The extracted application has an unexpected identity."
+                )
+            }
+
+            let executable = application.appendingPathComponent(
+                "Contents/MacOS/MacBox"
+            )
+
+            guard executable.path ==
+                    executable.resolvingSymlinksInPath().path,
+                  let attributes = try? fm.attributesOfItem(
+                    atPath: executable.path
+                  ),
+                  attributes[.type] as? FileAttributeType ==
+                    .typeRegular,
+                  fm.isExecutableFile(atPath: executable.path) else {
+
+                throw fail(
+                    "The extracted MacBox executable is invalid."
+                )
+            }
+
+            NSLog(
+                "MacBox: Production update prepared at %@",
+                application.path
+            )
+
+            return application
+
+        } catch {
+            // Remove incomplete extraction, leaving the
+            // previously verified ZIP untouched.
+            try? fm.removeItem(at: extractionRoot)
+            throw error
+        }
+    }
+
+    // Hand a verified MacBox update to the external updater.
+    // The running application is never replaced directly.
     private func updateMacBoxBinary(location: URL) {
 
+        #if DEBUG || MACBOX_RELEASE_TEST
+
+        // Development and Release-Test builds must never
+        // initiate a production application replacement.
         macboxUpdateProgressIndicator.isHidden = true
         macboxUpdateButton.isHidden = false
 
         NSLog(
-            "MacBox: Legacy self-installation blocked for %@",
-            location.lastPathComponent
+            "MacBox: Production self-update blocked in test build."
         )
 
-        let alert = NSAlert()
-        alert.alertStyle = .warning
-        alert.messageText = "MacBox self-update not yet available"
+        return
 
-        alert.informativeText = """
-        The application update was downloaded, but automatic
-        installation is not yet enabled.
+        #else
 
-        MacBox is transitioning to a verified external updater
-        that safely replaces the application after it exits.
+        func fail(_ message: String) -> NSError {
+            NSError(
+                domain: "MacBox.SelfUpdater",
+                code: 6,
+                userInfo: [
+                    NSLocalizedDescriptionKey: message
+                ]
+            )
+        }
 
-        Your existing MacBox installation has not been modified.
-        """
+        do {
+            let fm = FileManager.default
 
-        alert.addButton(withTitle: "OK")
-        alert.runModal()
+            let destination = Bundle.main.bundleURL
+                .standardizedFileURL
+
+            // Only our production application can initiate
+            // a production update.
+            guard Bundle.main.bundleIdentifier ==
+                    "io.github.settloe99.MacBox",
+                  destination.lastPathComponent == "MacBox.app" else {
+
+                throw fail(
+                    "This is not a production MacBox installation."
+                )
+            }
+
+            let helper = destination.appendingPathComponent(
+                "Contents/Helpers/MacBoxSelfUpdateHelper"
+            )
+
+            guard helper.path ==
+                    helper.resolvingSymlinksInPath().path,
+                  fm.isExecutableFile(atPath: helper.path) else {
+
+                throw fail(
+                    "The external MacBox updater helper is missing."
+                )
+            }
+
+            // Verify an application using the helper's
+            // trusted Developer ID signing requirement.
+            func verifyProductionApplication(_ app: URL) throws {
+
+                let verification = Process()
+                verification.executableURL = helper
+
+                verification.arguments = [
+                    "--verify-production-app",
+                    app.path
+                ]
+
+                try verification.run()
+                verification.waitUntilExit()
+
+                guard verification.terminationStatus == 0 else {
+                    throw fail(
+                        "Production application authentication failed. " +
+                        "The update has been cancelled. " +
+                        "A trusted Developer ID signing identity " +
+                        "must be configured before automatic " +
+                        "updates can be enabled."
+                    )
+                }
+            }
+
+            // Authenticate the currently installed application
+            // before preparing a replacement.
+            try verifyProductionApplication(destination)
+
+            // Extract the downloaded ZIP into our private
+            // staging directory.
+            let stagedApplication =
+                try prepareStagedMacBoxApplication(
+                    from: location
+                )
+
+            // Authenticate the extracted replacement.
+            try verifyProductionApplication(stagedApplication)
+
+            // Both applications must pass authentication
+            // before the user is offered installation.
+            let confirmation = NSAlert()
+            confirmation.alertStyle = .warning
+            confirmation.messageText = "Install MacBox update?"
+
+            confirmation.informativeText = """
+            The downloaded MacBox update has passed archive,
+            checksum and application signature verification.
+
+            MacBox will now close while its external updater
+            installs the replacement.
+
+            The existing application will be backed up before
+            replacement, and the updated application will
+            launch automatically.
+
+            Destination:
+            \(destination.path)
+            """
+
+            confirmation.addButton(
+                withTitle: "Update and Restart"
+            )
+
+            confirmation.addButton(
+                withTitle: "Cancel"
+            )
+
+            guard confirmation.runModal() ==
+                    .alertFirstButtonReturn else {
+
+                macboxUpdateProgressIndicator.isHidden = true
+                macboxUpdateButton.isHidden = false
+                return
+            }
+
+            // Launch the independent updater.
+            // It will wait for this MacBox process to exit.
+            let updater = Process()
+            updater.executableURL = helper
+
+            updater.arguments = [
+                "--install-production",
+                String(ProcessInfo.processInfo.processIdentifier),
+                stagedApplication.path,
+                destination.path
+            ]
+
+            try updater.run()
+
+            NSLog(
+                "MacBox: External production updater launched."
+            )
+
+            // The helper now owns installation and relaunch.
+            NSApp.terminate(nil)
+
+        } catch {
+
+            macboxUpdateProgressIndicator.isHidden = true
+            macboxUpdateButton.isHidden = false
+
+            NSLog(
+                "MacBox: Self-update preparation failed: %@",
+                error.localizedDescription
+            )
+
+            let alert = NSAlert()
+            alert.alertStyle = .critical
+            alert.messageText = "MacBox update cancelled"
+            alert.informativeText = error.localizedDescription
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+        }
+
+        #endif
     }
 
     // Delete a temporary file

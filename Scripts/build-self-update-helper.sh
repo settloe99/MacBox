@@ -1,15 +1,14 @@
 #!/bin/sh
 set -eu
 
-# Embed the laboratory helper only in Release-Test builds.
-case " ${SWIFT_ACTIVE_COMPILATION_CONDITIONS:-} " in
-    *" MACBOX_RELEASE_TEST "*)
-        ;;
-    *)
-        echo "MacBox: Skipping laboratory updater helper."
-        exit 0
-        ;;
-esac
+# Embed the self-update helper in Release builds.
+# DEBUG builds continue without the helper.
+# Production installation remains disabled in the helper itself.
+
+if [ "${CONFIGURATION:-}" != "Release" ]; then
+    echo "MacBox: Skipping updater helper for non-Release build."
+    exit 0
+fi
 
 SOURCE="${SRCROOT}/MacBox/Helpers/MacBoxSelfUpdateHelper.swift"
 
@@ -23,7 +22,7 @@ fi
 
 mkdir -p "$DESTINATION"
 
-echo "MacBox: Compiling Release-Test updater helper..."
+echo "MacBox: Compiling updater helper..."
 
 xcrun swiftc \
     -O \
