@@ -284,6 +284,8 @@
 			);
 			outputPaths = (
 				"$(TARGET_BUILD_DIR)/$(WRAPPER_NAME)/Contents/Helpers/MacBoxSelfUpdateHelper",
+				"$(DERIVED_FILE_DIR)/MacBoxSelfUpdateHelper-arm64",
+				"$(DERIVED_FILE_DIR)/MacBoxSelfUpdateHelper-x86_64",
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;

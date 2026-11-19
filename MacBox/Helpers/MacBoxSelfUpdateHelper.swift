@@ -32,14 +32,33 @@ private func validateApp(
     expectedBundleID: String
 ) throws {
 
+    // Read the actual on-disk Info.plist, not cached
+    // Foundation Bundle metadata from an earlier app
+    // occupying the same installation path.
+    let plistURL = url.appendingPathComponent(
+        "Contents/Info.plist"
+    )
+
     guard isRealDirectory(url),
-          let bundle = Bundle(url: url),
-          bundle.bundleIdentifier == expectedBundleID,
-          let executableName = bundle.object(
-            forInfoDictionaryKey: "CFBundleExecutable"
-          ) as? String,
-          executableName == "MacBox"
-    else {
+          plistURL.path ==
+            plistURL.resolvingSymlinksInPath().path,
+          let attributes = try? fm.attributesOfItem(
+            atPath: plistURL.path
+          ),
+          attributes[.type] as? FileAttributeType ==
+            .typeRegular,
+          let data = try? Data(contentsOf: plistURL),
+          let object = try? PropertyListSerialization.propertyList(
+            from: data,
+            options: [],
+            format: nil
+          ),
+          let info = object as? [String: Any],
+          info["CFBundleIdentifier"] as? String ==
+            expectedBundleID,
+          info["CFBundleExecutable"] as? String ==
+            "MacBox" else {
+
         throw fail("Invalid or unexpected MacBox application.")
     }
 
@@ -47,7 +66,16 @@ private func validateApp(
         "Contents/MacOS/MacBox"
     )
 
-    guard fm.isExecutableFile(atPath: executable.path) else {
+    guard executable.path ==
+            executable.resolvingSymlinksInPath().path,
+          let executableAttributes =
+            try? fm.attributesOfItem(
+                atPath: executable.path
+            ),
+          executableAttributes[.type] as? FileAttributeType ==
+            .typeRegular,
+          fm.isExecutableFile(atPath: executable.path) else {
+
         throw fail("MacBox executable is missing or invalid.")
     }
 }
@@ -474,6 +502,307 @@ private func runLaboratoryInstallation(
     }
 }
 
+
+// Inspect the ZIP structure before any extraction.
+// Accept only regular files and directories within MacBox.app
+// or Apple's optional __MACOSX metadata directory.
+private func validateProductionReleaseZIP(
+    at archiveURL: URL
+) throws {
+
+    let fm = FileManager.default
+
+    guard archiveURL.path ==
+            archiveURL.resolvingSymlinksInPath().path,
+          let attributes = try? fm.attributesOfItem(
+            atPath: archiveURL.path
+          ),
+          attributes[.type] as? FileAttributeType == .typeRegular,
+          let size = attributes[.size] as? NSNumber,
+          size.int64Value > 0,
+          size.int64Value <= 512 * 1024 * 1024 else {
+        throw fail("Unsafe release ZIP file.")
+    }
+
+    let archive = try Data(
+        contentsOf: archiveURL,
+        options: .mappedIfSafe
+    )
+
+    try archive.withUnsafeBytes { raw in
+
+        let bytes = raw.bindMemory(to: UInt8.self)
+        let length = bytes.count
+
+        func read16(_ offset: Int) -> Int? {
+            guard offset >= 0, offset <= length - 2 else {
+                return nil
+            }
+            return Int(bytes[offset]) |
+                (Int(bytes[offset + 1]) << 8)
+        }
+
+        func read32(_ offset: Int) -> Int? {
+            guard offset >= 0, offset <= length - 4 else {
+                return nil
+            }
+            return Int(bytes[offset]) |
+                (Int(bytes[offset + 1]) << 8) |
+                (Int(bytes[offset + 2]) << 16) |
+                (Int(bytes[offset + 3]) << 24)
+        }
+
+        guard length >= 22 else {
+            throw fail("ZIP end-of-directory record missing.")
+        }
+
+        // Locate the final ZIP central-directory record.
+        let lowest = max(0, length - 22 - 65535)
+        var endRecord: Int?
+
+        for offset in stride(
+            from: length - 22,
+            through: lowest,
+            by: -1
+        ) {
+            if read32(offset) == 0x06054b50,
+               let commentLength = read16(offset + 20),
+               offset + 22 + commentLength == length {
+                endRecord = offset
+                break
+            }
+        }
+
+        guard let eocd = endRecord,
+              let disk = read16(eocd + 4),
+              let centralDisk = read16(eocd + 6),
+              let diskEntries = read16(eocd + 8),
+              let entryCount = read16(eocd + 10),
+              let centralSize = read32(eocd + 12),
+              let centralOffset = read32(eocd + 16),
+              disk == 0,
+              centralDisk == 0,
+              diskEntries == entryCount,
+              entryCount > 0,
+              entryCount <= 20000,
+              entryCount != 0xFFFF,
+              centralSize != 0xFFFFFFFF,
+              centralOffset != 0xFFFFFFFF,
+              centralOffset + centralSize == eocd else {
+            throw fail(
+                "Unsupported or inconsistent ZIP central directory."
+            )
+        }
+
+        var cursor = centralOffset
+        var seen = Set<String>()
+        var regularFiles = Set<String>()
+        var ranges: [(start: Int, end: Int)] = []
+        var totalExpanded: UInt64 = 0
+
+        var foundInfo = false
+        var foundExecutable = false
+
+        for _ in 0..<entryCount {
+
+            guard cursor <= eocd - 46,
+                  read32(cursor) == 0x02014b50,
+                  let flags = read16(cursor + 8),
+                  let method = read16(cursor + 10),
+                  let packedSize = read32(cursor + 20),
+                  let expandedSize = read32(cursor + 24),
+                  let nameLength = read16(cursor + 28),
+                  let extraLength = read16(cursor + 30),
+                  let commentLength = read16(cursor + 32),
+                  let diskStart = read16(cursor + 34),
+                  let external = read32(cursor + 38),
+                  let localOffset = read32(cursor + 42) else {
+                throw fail("Invalid ZIP central-directory entry.")
+            }
+
+            let recordEnd = cursor + 46 +
+                nameLength + extraLength + commentLength
+
+            guard recordEnd <= eocd,
+                  nameLength > 0,
+                  nameLength <= 4096,
+                  diskStart == 0,
+                  packedSize != 0xFFFFFFFF,
+                  expandedSize != 0xFFFFFFFF,
+                  method == 0 || method == 8,
+                  (flags & ~0x080E) == 0 else {
+                throw fail("Unsupported ZIP entry.")
+            }
+
+            if method == 0 && packedSize != expandedSize {
+                throw fail("Invalid stored ZIP entry size.")
+            }
+
+            let nameStart = cursor + 46
+
+            let nameData = Data(
+                bytes: raw.baseAddress!.advanced(by: nameStart),
+                count: nameLength
+            )
+
+            guard let name = String(
+                data: nameData,
+                encoding: .utf8
+            ) else {
+                throw fail("Invalid ZIP filename encoding.")
+            }
+
+            guard name.hasPrefix("MacBox.app/") ||
+                    name.hasPrefix("__MACOSX/") else {
+                throw fail("ZIP entry outside MacBox.app.")
+            }
+
+            guard !name.contains("\\"),
+                  name.unicodeScalars.allSatisfy({
+                    $0.value >= 32 && $0.value != 127
+                  }) else {
+                throw fail("Unsafe ZIP filename characters.")
+            }
+
+            let directory = name.hasSuffix("/")
+            var parts = name.components(separatedBy: "/")
+
+            if directory {
+                parts.removeLast()
+            }
+
+            guard !parts.isEmpty,
+                  parts.allSatisfy({
+                    !$0.isEmpty &&
+                    $0 != "." &&
+                    $0 != ".." &&
+                    $0.utf8.count <= 255
+                  }) else {
+                throw fail("Unsafe ZIP path components.")
+            }
+
+            let logicalName = parts.joined(separator: "/")
+
+            let key = logicalName
+                .precomposedStringWithCanonicalMapping
+                .folding(
+                    options: [
+                        .caseInsensitive,
+                        .diacriticInsensitive,
+                        .widthInsensitive
+                    ],
+                    locale: Locale(identifier: "en_US_POSIX")
+                )
+
+            guard seen.insert(key).inserted else {
+                throw fail("Duplicate ZIP entry.")
+            }
+
+            // Unix file-type bits identify symlinks and special files.
+            let fileType = (external >> 16) & 0xF000
+
+            guard fileType == 0 ||
+                    fileType == (directory ? 0x4000 : 0x8000),
+                  (external & 0x10) == 0 || directory else {
+                throw fail("Symbolic link or special ZIP entry.")
+            }
+
+            if directory {
+                guard expandedSize == 0 else {
+                    throw fail("Directory contains file data.")
+                }
+            } else {
+                regularFiles.insert(key)
+            }
+
+            guard expandedSize <= 256 * 1024 * 1024 else {
+                throw fail("ZIP entry exceeds size limit.")
+            }
+
+            totalExpanded += UInt64(expandedSize)
+
+            guard totalExpanded <= 1024 * 1024 * 1024 else {
+                throw fail("ZIP extraction size limit exceeded.")
+            }
+
+            // Compare the local entry with the central directory.
+            guard localOffset < centralOffset,
+                  read32(localOffset) == 0x04034b50,
+                  read16(localOffset + 6) == flags,
+                  read16(localOffset + 8) == method,
+                  let localNameLength = read16(localOffset + 26),
+                  let localExtraLength = read16(localOffset + 28),
+                  localNameLength == nameLength else {
+                throw fail("Inconsistent local ZIP header.")
+            }
+
+            let localNameStart = localOffset + 30
+            let dataStart = localNameStart +
+                localNameLength + localExtraLength
+
+            guard dataStart <= centralOffset,
+                  packedSize <= centralOffset - dataStart else {
+                throw fail("ZIP entry exceeds archive boundaries.")
+            }
+
+            for index in 0..<nameLength {
+                guard bytes[localNameStart + index] ==
+                        bytes[nameStart + index] else {
+                    throw fail("ZIP filename header mismatch.")
+                }
+            }
+
+            ranges.append((
+                start: localOffset,
+                end: dataStart + packedSize
+            ))
+
+            if name == "MacBox.app/Contents/Info.plist" {
+                foundInfo = true
+            }
+
+            if name == "MacBox.app/Contents/MacOS/MacBox" {
+                foundExecutable = true
+            }
+
+            cursor = recordEnd
+        }
+
+        guard cursor == eocd,
+              foundInfo,
+              foundExecutable else {
+            throw fail("Incomplete or invalid MacBox ZIP contents.")
+        }
+
+        // No regular file can also act as a parent directory.
+        for key in seen {
+            var parts = key.components(separatedBy: "/")
+
+            while parts.count > 1 {
+                parts.removeLast()
+
+                guard !regularFiles.contains(
+                    parts.joined(separator: "/")
+                ) else {
+                    throw fail("ZIP file and directory path conflict.")
+                }
+            }
+        }
+
+        // Local ZIP headers and compressed data must not overlap.
+        ranges.sort { $0.start < $1.start }
+
+        for index in 1..<ranges.count {
+            guard ranges[index - 1].end <=
+                    ranges[index].start else {
+                throw fail("Overlapping ZIP entries.")
+            }
+        }
+    }
+
+    print("PASS: MacBox ZIP structure validated.")
+}
+
 private func extractAuthenticatedMacBoxRelease(
     manifestURL: URL,
     signatureURL: URL,
@@ -526,6 +855,11 @@ private func extractAuthenticatedMacBoxRelease(
             signatureURL: localSignature,
             archiveURL: localArchive
         )
+
+    // Independently inspect the authenticated ZIP before
+    // allowing the external helper to extract its contents.
+    // Reject unsafe paths, links, duplicates and oversized entries.
+    try validateProductionReleaseZIP(at: localArchive)
 
     // Extract the authenticated ZIP using macOS ditto.
     let extractor = Process()
@@ -813,6 +1147,196 @@ private func extractAuthenticatedMacBoxRelease(
     }
 }
 
+
+#if MACBOX_MIGRATION_LAB
+
+// Isolated acceptance test for migration from Moonif.MacBox.
+// This code is excluded from normal production builds.
+private func runLegacyMigrationLaboratory() throws {
+
+    let root = fm.homeDirectoryForCurrentUser
+        .appendingPathComponent(
+            "MacBox-ReleaseTest/LegacyMigration-Lab",
+            isDirectory: true
+        ).standardizedFileURL
+
+    let original = root.appendingPathComponent(
+        "MacBox.app",
+        isDirectory: true
+    )
+
+    let release = root.appendingPathComponent(
+        "Release",
+        isDirectory: true
+    )
+
+    guard isRealDirectory(root),
+          isRealDirectory(original),
+          isRealDirectory(release),
+          root.path == root.resolvingSymlinksInPath().path,
+          original.path == original.resolvingSymlinksInPath().path,
+          Bundle(url: original)?.bundleIdentifier ==
+            "Moonif.MacBox" else {
+        throw fail("Invalid legacy migration laboratory.")
+    }
+
+    // Verify the original application's code integrity.
+    try validateApp(
+        original,
+        expectedBundleID: "Moonif.MacBox"
+    )
+
+    let signatureCheck = Process()
+    signatureCheck.executableURL = URL(
+        fileURLWithPath: "/usr/bin/codesign"
+    )
+    signatureCheck.arguments = [
+        "--verify", "--deep", "--strict", original.path
+    ]
+    signatureCheck.standardOutput = FileHandle.nullDevice
+    signatureCheck.standardError = FileHandle.nullDevice
+
+    try signatureCheck.run()
+    signatureCheck.waitUntilExit()
+
+    guard signatureCheck.terminationStatus == 0 else {
+        throw fail("Original MacBox code signature is invalid.")
+    }
+
+    let identifier = UUID().uuidString
+
+    let workspace = root.appendingPathComponent(
+        ".MacBox-Legacy-work-\(identifier)",
+        isDirectory: true
+    )
+
+    let staged = workspace.appendingPathComponent(
+        "MacBox.app",
+        isDirectory: true
+    )
+
+    let parked = root.appendingPathComponent(
+        ".MacBox-Legacy-parked-\(identifier).app",
+        isDirectory: true
+    )
+
+    let rejected = root.appendingPathComponent(
+        ".MacBox-Legacy-rejected-\(identifier).app",
+        isDirectory: true
+    )
+
+    let backups = root.appendingPathComponent(
+        ".MacBox-Legacy-backups",
+        isDirectory: true
+    )
+
+    guard !fm.fileExists(atPath: backups.path),
+          !fm.fileExists(atPath: workspace.path),
+          !fm.fileExists(atPath: parked.path),
+          !fm.fileExists(atPath: rejected.path) else {
+        throw fail("Migration laboratory already contains transactions.")
+    }
+
+    try fm.createDirectory(
+        at: workspace,
+        withIntermediateDirectories: false,
+        attributes: [.posixPermissions: 0o700]
+    )
+
+    defer {
+        try? fm.removeItem(at: workspace)
+    }
+
+    // Authenticate and extract the signed replacement.
+    let authenticated = try extractAuthenticatedMacBoxRelease(
+        manifestURL: release.appendingPathComponent(
+            "MacBox-release.manifest"
+        ),
+        signatureURL: release.appendingPathComponent(
+            "MacBox-release.manifest.sig"
+        ),
+        archiveURL: release.appendingPathComponent(
+            "MacBox-v0.6.4.zip"
+        ),
+        workspace: workspace
+    )
+
+    guard authenticated.standardizedFileURL ==
+            staged.standardizedFileURL else {
+        throw fail("Unexpected replacement application location.")
+    }
+
+    try validateProductionApp(staged)
+
+    // Preserve the original application independently.
+    try fm.createDirectory(
+        at: backups,
+        withIntermediateDirectories: false,
+        attributes: [.posixPermissions: 0o700]
+    )
+
+    let backup = backups.appendingPathComponent(
+        "MacBox-\(identifier).app",
+        isDirectory: true
+    )
+
+    try fm.copyItem(at: original, to: backup)
+
+    try validateApp(
+        backup,
+        expectedBundleID: "Moonif.MacBox"
+    )
+
+    var originalParked = false
+    var replacementInstalled = false
+
+    do {
+        try fm.moveItem(at: original, to: parked)
+        originalParked = true
+
+        try fm.moveItem(at: staged, to: original)
+        replacementInstalled = true
+
+        try validateProductionApp(original)
+
+        // Fresh on-disk identity and signature verified above.
+
+        // Independent backup remains available for recovery.
+        try? fm.removeItem(at: parked)
+
+        print("PASS: Legacy MacBox migrated in laboratory.")
+        print("PASS: Replacement authenticated and verified.")
+        print("Original application backup: \(backup.path)")
+        print("Migrated application: \(original.path)")
+
+    } catch {
+        let installationError = error
+
+        if originalParked {
+            do {
+                if replacementInstalled &&
+                    fm.fileExists(atPath: original.path) {
+                    try fm.moveItem(at: original, to: rejected)
+                }
+
+                try fm.moveItem(at: parked, to: original)
+
+                print("PASS: Original application restored.")
+            } catch {
+                throw fail(
+                    "Legacy migration rollback failed. " +
+                    "Original may remain at \(parked.path). " +
+                    "Error: \(error.localizedDescription)"
+                )
+            }
+        }
+
+        throw installationError
+    }
+}
+
+#endif
+
 private func main() throws {
     let args = Array(CommandLine.arguments.dropFirst())
 
@@ -860,6 +1384,26 @@ private func main() throws {
 
         return
     }
+
+
+    if args.count == 2,
+       args[0] == "--validate-release-zip" {
+
+        try validateProductionReleaseZIP(
+            at: URL(fileURLWithPath: args[1])
+        )
+        return
+    }
+
+
+    #if MACBOX_MIGRATION_LAB
+
+    if args == ["--migrate-legacy-lab"] {
+        try runLegacyMigrationLaboratory()
+        return
+    }
+
+    #endif
 
     if args == ["--preflight"] {
         guard isRealDirectory(root) else {

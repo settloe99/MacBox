@@ -1846,9 +1846,50 @@ class MainViewController: NSViewController {
 
     // Add VM to the table view
     func addVM(vm: VM, vmTemplate: VMTemplate? = nil) {
-        #if DEBUG || MACBOX_RELEASE_TEST
-        NSLog("MacBoxDev: VM creation and import disabled during isolation testing.")
+        #if DEBUG
+
+        NSLog("MacBoxDev: VM creation remains disabled.")
         return
+
+        #elseif MACBOX_RELEASE_TEST
+
+        let testRoot = fileManager.homeDirectoryForCurrentUser
+            .appendingPathComponent(
+                "MacBox-ReleaseTest",
+                isDirectory: true
+            ).standardizedFileURL
+
+        let proposedDestination: URL
+
+        if let existingPath = vm.path {
+            proposedDestination = URL(
+                fileURLWithPath: existingPath,
+                isDirectory: true
+            ).standardizedFileURL
+        } else {
+            proposedDestination = testRoot
+                .appendingPathComponent(
+                    "MacBox Compatibility Test",
+                    isDirectory: true
+                )
+        }
+
+        // Never create or import a VM outside the laboratory.
+        guard vm.name == "MacBox Compatibility Test",
+              homeDirURL.standardizedFileURL == testRoot,
+              testRoot.path ==
+                testRoot.resolvingSymlinksInPath().path,
+              proposedDestination.deletingLastPathComponent()
+                .standardizedFileURL == testRoot,
+              proposedDestination.path ==
+                proposedDestination.resolvingSymlinksInPath().path else {
+
+            NSLog(
+                "MacBoxReleaseTest: VM creation blocked outside laboratory."
+            )
+            return
+        }
+
         #endif
 
         // Make sure vm has a path
@@ -2067,9 +2108,68 @@ class MainViewController: NSViewController {
 
     // Start VM process
     private func startVM(launchSettings: Bool = false) {
-        #if DEBUG || MACBOX_RELEASE_TEST
-        NSLog("MacBoxDev: VM launching disabled during isolation testing.")
+        #if DEBUG
+
+        NSLog("MacBoxDev: VM launching remains disabled.")
         return
+
+        #elseif MACBOX_RELEASE_TEST
+
+        // Only allow the disposable compatibility test VM.
+        guard let selected = currentSelectedVM,
+              vmList.indices.contains(selected) else {
+            NSLog("MacBoxReleaseTest: No valid VM selected.")
+            return
+        }
+
+        let testRoot = fileManager.homeDirectoryForCurrentUser
+            .appendingPathComponent(
+                "MacBox-ReleaseTest",
+                isDirectory: true
+            ).standardizedFileURL
+
+        let expectedVM = testRoot
+            .appendingPathComponent(
+                "MacBox Compatibility Test",
+                isDirectory: true
+            ).standardizedFileURL
+
+        let selectedVM = vmList[selected]
+
+        let actualVM = URL(
+            fileURLWithPath: selectedVM.path ?? "",
+            isDirectory: true
+        ).standardizedFileURL
+
+        var isDirectory: ObjCBool = false
+
+        guard selectedVM.name == "MacBox Compatibility Test",
+              homeDirURL.standardizedFileURL == testRoot,
+              testRoot.path ==
+                testRoot.resolvingSymlinksInPath().path,
+              actualVM == expectedVM,
+              actualVM.path ==
+                actualVM.resolvingSymlinksInPath().path,
+              fileManager.fileExists(
+                atPath: actualVM.path,
+                isDirectory: &isDirectory
+              ),
+              isDirectory.boolValue,
+              fileManager.fileExists(
+                atPath: actualVM
+                    .appendingPathComponent("86box.cfg").path
+              ) else {
+
+            NSLog(
+                "MacBoxReleaseTest: VM launch blocked outside laboratory."
+            )
+            return
+        }
+
+        NSLog(
+            "MacBoxReleaseTest: Permitting isolated compatibility VM launch."
+        )
+
         #endif
 
         if currentSelectedVM != nil {
@@ -2127,6 +2227,35 @@ class MainViewController: NSViewController {
                         withBundleIdentifier: "net.86Box.86Box"
                     )
             }
+
+            #if MACBOX_RELEASE_TEST
+
+            // Compatibility tests must use our isolated 86Box.
+            // Never fall back to the user's normal installation.
+            let isolatedEmulator = fileManager
+                .homeDirectoryForCurrentUser
+                .appendingPathComponent(
+                    "MacBox-ReleaseTest/86Box.app",
+                    isDirectory: true
+                ).standardizedFileURL
+
+            guard isolatedEmulator.path ==
+                    isolatedEmulator.resolvingSymlinksInPath().path,
+                  let emulatorBundle = Bundle(
+                    url: isolatedEmulator
+                  ),
+                  emulatorBundle.bundleIdentifier ==
+                    "net.86Box.86Box" else {
+
+                NSLog(
+                    "MacBoxReleaseTest: Isolated 86Box is missing or unsafe."
+                )
+                return
+            }
+
+            selectedEmulatorURL = isolatedEmulator
+
+            #endif
 
             guard let emulatorURL = selectedEmulatorURL else {
                 let alert = NSAlert()
