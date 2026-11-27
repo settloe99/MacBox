@@ -94,3 +94,71 @@ not been independently tested.
 Administrator-authorised migration, replacement and rollback
 have passed isolated protected-installation tests. The complete
 elevated production UI workflow has not been independently tested.
+
+## MacBox 0.6.6
+
+The first community-driven improvement release of the
+maintained MacBox fork.
+
+### VM storage safety
+
+Addresses Moonif/MacBox#31.
+
+- Relocation restricted to registered managed VM directories.
+- Unrelated files and directories remain untouched.
+- Verified copying using SHA-256.
+- Preservation of recognised external media references.
+- Destination conflict protection.
+- Transactional publication and rollback.
+- Interrupted relocation recovery.
+- Protection against relocation while 86Box is running.
+- Persistent storage location selection.
+- Safe return to previous storage locations.
+- Retention of original VM data as recovery copies.
+- Background copying and verification with an animated
+  modal progress window.
+
+### Virtual machine launch improvements
+
+- Fixed opening VM settings while another 86Box instance
+  is running, based on Moonif/MacBox#62.
+- Confirmed normal VM startup and shutdown behaviour
+  through repeated launch tests.
+- Verified updated 86Box emulator code integrity.
+
+### BIOS keyboard workaround
+
+Investigation of Moonif/MacBox#56 confirmed identical
+keyboard behaviour when launching 86Box independently
+of MacBox.
+
+On MacBooks without a dedicated numeric keypad, use:
+
+- Fn + Up Arrow for Page Up.
+- Fn + Down Arrow for Page Down.
+
+These combinations can change BIOS settings where
+supported by the emulated BIOS.
+
+### Testing and limitations
+
+Storage relocation, rollback, simulated interruption
+recovery and return relocation were tested using an
+isolated VM laboratory.
+
+Original recovery copies consume additional disk space
+and are not automatically deleted.
+
+Live production storage relocation, uncommon media
+dependencies, physical power-loss recovery and very
+large virtual disk relocations have not been
+independently verified.
+
+Historical intermittent VM startup failures were not
+reproduced during six successful launch tests.
+
+The exact historical updater failure environment
+reported in Moonif/MacBox#57 was not reproduced.
+
+Credit to the original community reporters and
+contributors whose work informed this release.

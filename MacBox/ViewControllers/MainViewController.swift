@@ -3075,7 +3075,7 @@ class MainViewController: NSViewController {
             // Set process arguments
             let argsString: String = "--args"
             let args:[String] = launchSettings ?
-            ["-W", vmAppArg,vmAppVersion,argsString,"-P","\(vmPath)","-S"] :
+            ["-n", "-W", vmAppArg,vmAppVersion,argsString,"-P","\(vmPath)","-S"] :
             vmFullScreen ?
             ["-n", "-W", vmAppArg,vmAppVersion,argsString,"-P","\(vmPath)","-V",vmName, "-F"] :
             ["-n", "-W", vmAppArg,vmAppVersion,argsString,"-P","\(vmPath)","-V",vmName]
