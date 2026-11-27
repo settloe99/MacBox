@@ -850,6 +850,19 @@ exit "$STATUS"
         return true
     }
 
+    func applicationShouldTerminate(
+        _ sender: NSApplication
+    ) -> NSApplication.TerminateReply {
+
+        if MainViewController.instance?
+            .storageRelocationInProgress == true {
+
+            return .terminateCancel
+        }
+
+        return .terminateNow
+    }
+
     func applicationWillTerminate(_ aNotification: Notification) {
         // Insert code here to tear down your application
         if let mainVC = MainViewController.instance  {

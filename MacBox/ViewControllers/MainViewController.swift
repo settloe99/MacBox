@@ -82,6 +82,11 @@ class MainViewController: NSViewController {
         configView()
         // Set MacBox home directory
         setHomeDir()
+
+        guard recoverStorageAtStartup() else {
+            NSApp.terminate(nil)
+            return
+        }
         // Initialize MacBox files
         initFiles()
         // Set screensaver & screen sleep preference
@@ -1268,7 +1273,12 @@ class MainViewController: NSViewController {
 
     // Set MacBox home directory path
     private func setHomeDir() {
-        #if MACBOX_RELEASE_TEST
+
+        #if MACBOX_STORAGE_UI_TEST
+
+        homeDirURL = defaultStorageURL
+
+        #elseif MACBOX_RELEASE_TEST
         homeDirURL = URL(
             fileURLWithPath: "MacBox-ReleaseTest",
             isDirectory: true,
@@ -1388,22 +1398,712 @@ class MainViewController: NSViewController {
     }
 
     // Update the config file for custom HomeDir path
-    func updateConfigFile(previousLocation: URL, newLocation: URL) {
-        for vm in vmList {
-            guard let isValid = vm.path?.hasPrefix(previousLocation.path) else { return }
-            if isValid {
-                if let index = vmList.firstIndex(where: {$0.path == vm.path}) {
-                    let newVMPath = vm.path?.replacingOccurrences(of: previousLocation.path, with: newLocation.path)
-                    vmList[index].path = newVMPath
-                    // Update config file
-                    writeConfigFile()
-                    // Update HomeDir URL
-                    homeDirURL = newLocation
+
+    // MARK: Safe VM storage relocation
+
+    private struct StorageSelection: Codable {
+        let path: String
+        let useDefault: Bool
+    }
+
+    private var storageRecoveryRequired = false
+
+    private(set) var storageRelocationInProgress = false
+
+    var storagePreferenceKey: String {
+
+        #if MACBOX_STORAGE_UI_TEST
+        return "MacBoxStorageUITestPath"
+        #else
+        return "homeDirPath"
+        #endif
+    }
+
+    var defaultStorageURL: URL {
+
+        #if MACBOX_STORAGE_UI_TEST
+
+        let folder =
+            "MacBox-ReleaseTest/StorageRelocation-UI-Lab/Default"
+
+        #elseif MACBOX_RELEASE_TEST
+
+        let folder = "MacBox-ReleaseTest"
+
+        #elseif DEBUG
+
+        let folder = "MacBox-Dev"
+
+        #else
+
+        let folder = "MacBox"
+
+        #endif
+
+        return fileManager.homeDirectoryForCurrentUser
+            .appendingPathComponent(
+                folder,
+                isDirectory: true
+            ).standardizedFileURL
+    }
+
+    private func storageFailure(
+        _ message: String
+    ) -> NSError {
+
+        NSError(
+            domain: "MacBox.StorageRelocation",
+            code: 6,
+            userInfo: [
+                NSLocalizedDescriptionKey: message
+            ]
+        )
+    }
+
+    private func storageStateDirectory() throws -> URL {
+
+        let directory: URL
+
+        #if MACBOX_STORAGE_UI_TEST
+
+        directory = defaultStorageURL
+            .deletingLastPathComponent()
+            .appendingPathComponent(
+                "State",
+                isDirectory: true
+            )
+
+        #else
+
+        let support = try fileManager.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        )
+
+        directory = support.appendingPathComponent(
+            "io.github.settloe99.MacBox/StorageRelocation",
+            isDirectory: true
+        ).standardizedFileURL
+
+        #endif
+
+        guard directory.path ==
+                directory.resolvingSymlinksInPath().path else {
+
+            throw storageFailure(
+                "Unsafe storage relocation state directory."
+            )
+        }
+
+        try fileManager.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+
+        guard directory.path ==
+                directory.resolvingSymlinksInPath().path else {
+
+            throw storageFailure(
+                "Unsafe storage relocation state directory."
+            )
+        }
+
+        return directory
+    }
+
+    private func validateStorageUITestPath(
+        _ url: URL
+    ) throws {
+
+        #if MACBOX_STORAGE_UI_TEST
+
+        let root = defaultStorageURL
+            .deletingLastPathComponent()
+
+        let allowed = [
+            root.appendingPathComponent("Default").path,
+            root.appendingPathComponent("Custom").path
+        ]
+
+        guard allowed.contains(
+            url.standardizedFileURL.path
+        ),
+              url.path ==
+                url.resolvingSymlinksInPath().path else {
+
+            throw storageFailure(
+                "Storage test blocked outside its laboratory."
+            )
+        }
+
+        #endif
+    }
+
+    private func recoverStorageAtStartup() -> Bool {
+
+        #if (DEBUG || MACBOX_RELEASE_TEST) && !MACBOX_STORAGE_UI_TEST
+
+        return true
+
+        #else
+
+        do {
+
+            let state = try storageStateDirectory()
+
+            let selectionURL = state
+                .appendingPathComponent("Selection.json")
+
+            let pendingURL = state
+                .appendingPathComponent("Pending.json")
+
+            if fileManager.fileExists(
+                atPath: selectionURL.path
+            ) {
+
+                guard selectionURL.path ==
+                        selectionURL.resolvingSymlinksInPath().path,
+                      let attributes = try? fileManager.attributesOfItem(
+                        atPath: selectionURL.path
+                      ),
+                      attributes[.type] as? FileAttributeType ==
+                        .typeRegular else {
+
+                    throw storageFailure(
+                        "Unsafe saved storage selection."
+                    )
+                }
+
+                let selection = try JSONDecoder().decode(
+                    StorageSelection.self,
+                    from: Data(contentsOf: selectionURL)
+                )
+
+                guard selection.path.hasPrefix("/") else {
+                    throw storageFailure(
+                        "Invalid saved storage location."
+                    )
+                }
+
+                let selected = URL(
+                    fileURLWithPath: selection.path,
+                    isDirectory: true
+                ).standardizedFileURL
+
+                try validateStorageUITestPath(selected)
+
+                guard !selection.useDefault ||
+                        selected.path == defaultStorageURL.path else {
+
+                    throw storageFailure(
+                        "Inconsistent default storage selection."
+                    )
+                }
+
+                homeDirURL = selected
+
+                if selection.useDefault {
+                    userDefaults.removeObject(
+                        forKey: storagePreferenceKey
+                    )
+                } else {
+                    userDefaults.set(
+                        selected.path,
+                        forKey: storagePreferenceKey
+                    )
                 }
             }
+
+            try validateStorageUITestPath(
+                homeDirURL.standardizedFileURL
+            )
+
+            try VMStorageRelocationPlan.recoverPendingActivation(
+                recordURL: pendingURL,
+                activeStorage: homeDirURL
+            )
+
+            // Do not silently create an empty library if
+            // the previously selected external drive is offline.
+            if fileManager.fileExists(
+                atPath: selectionURL.path
+            ) {
+
+                let config = homeDirURL
+                    .appendingPathComponent("Config")
+
+                guard fileManager.fileExists(
+                    atPath: config.path
+                ) else {
+
+                    throw storageFailure(
+                        "The selected VM library is unavailable."
+                    )
+                }
+            }
+
+            return true
+
+        } catch {
+
+            let alert = NSAlert()
+
+            alert.alertStyle = .critical
+            alert.messageText = "VM storage recovery required"
+
+            alert.informativeText =
+                error.localizedDescription +
+                "\n\nMacBox will close without opening the VM library."
+
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+
+            return false
         }
-        // Recheck for MacBox in-case it was moved with the home directory
-        checkFor86Box(url: nil, appVer: nil, buildVer: nil, ignoreVersionCheck: true)
+
+        #endif
+    }
+
+    private func ensureStorageRelocationIsIdle() throws {
+
+        guard currentRunningVM.isEmpty else {
+
+            throw storageFailure(
+                "Close all running virtual machines before relocating storage."
+            )
+        }
+
+        // Also detect independently launched emulator processes.
+        let process = Process()
+
+        process.executableURL = URL(
+            fileURLWithPath: "/usr/bin/pgrep"
+        )
+
+        process.arguments = ["-ix", "86Box"]
+
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+
+        try process.run()
+        process.waitUntilExit()
+
+        guard process.terminationStatus == 1 else {
+
+            throw storageFailure(
+                "Close all 86Box instances before relocating storage."
+            )
+        }
+
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+
+        let otherMacBoxRunning =
+            NSWorkspace.shared.runningApplications.contains {
+
+                $0.processIdentifier != ownPID &&
+                [
+                    "Moonif.MacBox",
+                    "io.github.settloe99.MacBox",
+                    "io.github.settloe99.MacBoxReleaseTest"
+                ].contains($0.bundleIdentifier ?? "")
+            }
+
+        guard !otherMacBoxRunning else {
+
+            throw storageFailure(
+                "Close other MacBox instances before relocating storage."
+            )
+        }
+    }
+
+
+    // Thread-safe communication between the filesystem
+    // worker and the main application thread.
+    private final class StorageWorkResult<Value>: @unchecked Sendable {
+
+        private let lock = NSLock()
+        private var result: Result<Value, Error>?
+
+        func store(_ value: Result<Value, Error>) {
+
+            lock.lock()
+            defer { lock.unlock() }
+
+            result = value
+        }
+
+        func read() -> Result<Value, Error>? {
+
+            lock.lock()
+            defer { lock.unlock() }
+
+            return result
+        }
+    }
+
+    private func performStorageWork<Value>(
+        message: String,
+        work: @escaping () throws -> Value
+    ) throws -> Value {
+
+        precondition(Thread.isMainThread)
+
+        let outcome = StorageWorkResult<Value>()
+
+        let panel = NSPanel(
+            contentRect: NSRect(
+                x: 0,
+                y: 0,
+                width: 440,
+                height: 140
+            ),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+
+        panel.title = "Relocating VM storage"
+        panel.isReleasedWhenClosed = false
+        panel.hidesOnDeactivate = false
+
+        let heading = NSTextField(
+            labelWithString: message
+        )
+
+        heading.alignment = .center
+        heading.font = .systemFont(
+            ofSize: 13,
+            weight: .medium
+        )
+
+        heading.frame = NSRect(
+            x: 20,
+            y: 92,
+            width: 400,
+            height: 22
+        )
+
+        let progress = NSProgressIndicator(
+            frame: NSRect(
+                x: 30,
+                y: 58,
+                width: 380,
+                height: 16
+            )
+        )
+
+        progress.style = .bar
+        progress.isIndeterminate = true
+
+        let detail = NSTextField(
+            labelWithString:
+                "Large virtual disks may take some time."
+        )
+
+        detail.alignment = .center
+        detail.textColor = .secondaryLabelColor
+
+        detail.frame = NSRect(
+            x: 20,
+            y: 22,
+            width: 400,
+            height: 20
+        )
+
+        panel.contentView?.addSubview(heading)
+        panel.contentView?.addSubview(progress)
+        panel.contentView?.addSubview(detail)
+
+        panel.center()
+
+        // Filesystem work runs outside the main thread.
+        DispatchQueue.global(qos: .userInitiated).async {
+
+            outcome.store(
+                Result {
+                    try work()
+                }
+            )
+        }
+
+        // Poll completion from the modal run loop.
+        // The worker never accesses AppKit controls.
+        let timer = Timer(
+            timeInterval: 0.1,
+            repeats: true
+        ) { _ in
+
+            if outcome.read() != nil {
+                NSApp.stopModal()
+            }
+        }
+
+        RunLoop.main.add(
+            timer,
+            forMode: .modalPanel
+        )
+
+        progress.startAnimation(nil)
+        panel.makeKeyAndOrderFront(nil)
+
+        defer {
+
+            timer.invalidate()
+            progress.stopAnimation(nil)
+            panel.orderOut(nil)
+        }
+
+        // Prevent returning before the worker has finished.
+        repeat {
+            _ = NSApp.runModal(for: panel)
+        } while outcome.read() == nil
+
+        guard let result = outcome.read() else {
+            throw storageFailure(
+                "Storage operation returned no result."
+            )
+        }
+
+        return try result.get()
+    }
+
+    @discardableResult
+    func relocateStorageSafely(
+        to requestedDestination: URL,
+        useDefault: Bool
+    ) throws -> Bool {
+
+        #if (DEBUG || MACBOX_RELEASE_TEST) && !MACBOX_STORAGE_UI_TEST
+
+        throw storageFailure(
+            "Storage relocation is disabled in this test configuration."
+        )
+
+        #else
+
+        guard !storageRelocationInProgress else {
+            throw storageFailure(
+                "A storage relocation is already in progress."
+            )
+        }
+
+        storageRelocationInProgress = true
+
+        defer {
+            storageRelocationInProgress = false
+        }
+
+        guard !storageRecoveryRequired else {
+
+            throw storageFailure(
+                "Restart MacBox to complete storage recovery."
+            )
+        }
+
+        try ensureStorageRelocationIsIdle()
+
+        let source = homeDirURL.standardizedFileURL
+
+        let destination =
+            requestedDestination.standardizedFileURL
+
+        try validateStorageUITestPath(source)
+        try validateStorageUITestPath(destination)
+
+        if source.path == destination.path {
+            return true
+        }
+
+        if useDefault {
+
+            guard destination.path ==
+                    defaultStorageURL.path else {
+
+                throw storageFailure(
+                    "Invalid default storage location."
+                )
+            }
+
+            if !fileManager.fileExists(
+                atPath: destination.path
+            ) {
+
+                try fileManager.createDirectory(
+                    at: destination,
+                    withIntermediateDirectories: false,
+                    attributes: [.posixPermissions: 0o700]
+                )
+            }
+        }
+
+        let state = try storageStateDirectory()
+
+        let selectionURL = state
+            .appendingPathComponent("Selection.json")
+
+        let pendingURL = state
+            .appendingPathComponent("Pending.json")
+
+        guard !fileManager.fileExists(
+            atPath: pendingURL.path
+        ) else {
+
+            throw storageFailure(
+                "A previous relocation requires recovery."
+            )
+        }
+
+        let plan = try VMStorageRelocationPlan.make(
+            source: source,
+            destination: destination,
+            vms: vmList
+        )
+
+        let alert = NSAlert()
+
+        alert.alertStyle = .informational
+        alert.messageText = "Change VM storage location?"
+
+        alert.informativeText =
+            "\(plan.items.count) registered VM folder(s) will be copied and verified.\n\n" +
+            "Destination:\n\(destination.path)\n\n" +
+            "Original VM files and unrelated files will be retained."
+
+        alert.addButton(withTitle: "Relocate")
+        alert.addButton(withTitle: "Cancel")
+
+        guard alert.runModal() ==
+                .alertFirstButtonReturn else {
+            return false
+        }
+
+        try ensureStorageRelocationIsIdle()
+
+        let prepared = try performStorageWork(
+            message: "Copying and verifying virtual machines..."
+        ) {
+            try plan.prepareRelocation()
+        }
+
+        try VMStorageRelocationPlan.beginActivation(
+            prepared,
+            recordURL: pendingURL
+        )
+
+        do {
+
+            try ensureStorageRelocationIsIdle()
+
+            try performStorageWork(
+                message: "Verifying and publishing the new library..."
+            ) {
+                try VMStorageRelocationPlan.publish(prepared)
+            }
+
+            // Recheck emulator activity before activating
+            // the replacement storage location.
+            try ensureStorageRelocationIsIdle()
+
+            // Commit the selected location before updating
+            // the in-memory library and preference.
+            let selection = StorageSelection(
+                path: destination.path,
+                useDefault: useDefault
+            )
+
+            guard (try? fileManager.destinationOfSymbolicLink(
+                atPath: selectionURL.path
+            )) == nil else {
+
+                throw storageFailure(
+                    "Unsafe storage selection record."
+                )
+            }
+
+            try JSONEncoder().encode(selection).write(
+                to: selectionURL,
+                options: .atomic
+            )
+
+        } catch {
+
+            let originalError = error
+
+            do {
+
+                try VMStorageRelocationPlan.recoverPendingActivation(
+                    recordURL: pendingURL,
+                    activeStorage: source
+                )
+
+            } catch {
+
+                storageRecoveryRequired = true
+
+                throw storageFailure(
+                    "Relocation failed and recovery requires a restart.\n\n" +
+                    error.localizedDescription
+                )
+            }
+
+            throw originalError
+        }
+
+        // The storage selection is committed.
+        // Never roll back to the old library from this point.
+        homeDirURL = destination
+        vmList = plan.updatedVMs
+
+        if useDefault {
+
+            userDefaults.removeObject(
+                forKey: storagePreferenceKey
+            )
+
+        } else {
+
+            userDefaults.set(
+                destination.path,
+                forKey: storagePreferenceKey
+            )
+        }
+
+        vmsTableView.reloadData()
+
+        // Refresh discovered VM-relative ROM paths.
+        versionInfoObject.romsUrls.removeAll()
+        checkForRoms()
+
+        do {
+
+            try VMStorageRelocationPlan.recoverPendingActivation(
+                recordURL: pendingURL,
+                activeStorage: destination
+            )
+
+        } catch {
+
+            storageRecoveryRequired = true
+
+            let warning = NSAlert()
+
+            warning.alertStyle = .warning
+            warning.messageText = "Storage relocated"
+
+            warning.informativeText =
+                "The new library is active, but transaction recovery requires a restart.\n\n" +
+                error.localizedDescription
+
+            warning.addButton(withTitle: "OK")
+            warning.runModal()
+        }
+
+        return true
+
+        #endif
     }
 
     // Check if 86Box is installed, and check for updated version
@@ -1853,6 +2553,69 @@ class MainViewController: NSViewController {
 
         NSLog("MacBoxDev: VM creation remains disabled.")
         return
+
+        #elseif MACBOX_STORAGE_UI_TEST && MACBOX_RELEASE_TEST
+
+        let activeStorage = homeDirURL.standardizedFileURL
+
+        do {
+            try validateStorageUITestPath(activeStorage)
+        } catch {
+            NSLog("MacBoxStorageTest: Unsafe storage location.")
+            return
+        }
+
+        // Only permit loading our two existing dummy VMs.
+        // Creation and import remain disabled.
+        guard vmTemplate == nil,
+              let name = vm.name,
+              ["Storage Test 98", "Storage Test XP"].contains(name),
+              let path = vm.path else {
+
+            NSLog("MacBoxStorageTest: Unrecognised test VM.")
+            return
+        }
+
+        let proposedDestination = URL(
+            fileURLWithPath: path,
+            isDirectory: true
+        ).standardizedFileURL
+
+        let allowedFolderPattern =
+            #"\A"# +
+            NSRegularExpression.escapedPattern(for: name) +
+            #"(?: \(Relocated [1-9][0-9]*\))*\z"#
+
+        let validFolderName =
+            proposedDestination.lastPathComponent.range(
+                of: allowedFolderPattern,
+                options: .regularExpression
+            ) != nil
+
+        let configuration = proposedDestination
+            .appendingPathComponent("86box.cfg")
+
+        guard validFolderName,
+              proposedDestination.deletingLastPathComponent().path ==
+                activeStorage.path,
+              proposedDestination.path ==
+                proposedDestination.resolvingSymlinksInPath().path,
+              let directoryAttributes = try? fileManager.attributesOfItem(
+                atPath: proposedDestination.path
+              ),
+              directoryAttributes[.type] as? FileAttributeType ==
+                .typeDirectory,
+              configuration.path ==
+                configuration.resolvingSymlinksInPath().path,
+              let configAttributes = try? fileManager.attributesOfItem(
+                atPath: configuration.path
+              ),
+              configAttributes[.type] as? FileAttributeType ==
+                .typeRegular else {
+
+            NSLog("MacBoxStorageTest: Unsafe test VM path.")
+            return
+        }
 
         #elseif MACBOX_RELEASE_TEST
 
