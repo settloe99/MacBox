@@ -1,4 +1,5 @@
 import CommonCrypto
+import CryptoKit
 import Foundation
 import Darwin
 import Security
@@ -506,9 +507,10 @@ private func runLaboratoryInstallation(
 // Inspect the ZIP structure before any extraction.
 // Accept only regular files and directories within MacBox.app
 // or Apple's optional __MACOSX metadata directory.
+@discardableResult
 private func validateProductionReleaseZIP(
     at archiveURL: URL
-) throws {
+) throws -> String {
 
     let fm = FileManager.default
 
@@ -526,7 +528,7 @@ private func validateProductionReleaseZIP(
 
     let archive = try Data(
         contentsOf: archiveURL,
-        options: .mappedIfSafe
+        options: []
     )
 
     try archive.withUnsafeBytes { raw in
@@ -800,7 +802,13 @@ private func validateProductionReleaseZIP(
         }
     }
 
+    let validatedDigest = SHA256.hash(data: archive)
+        .map { String(format: "%02x", $0) }
+        .joined()
+
     print("PASS: MacBox ZIP structure validated.")
+
+    return validatedDigest
 }
 
 private func extractAuthenticatedMacBoxRelease(
@@ -920,6 +928,10 @@ private func extractAuthenticatedMacBoxRelease(
         destination: URL
     ) throws {
 
+    guard geteuid() != 0 else {
+        throw fail("MacBox updater must not run as root.")
+    }
+
     let home = fm.homeDirectoryForCurrentUser.standardizedFileURL
 
     let stagingRoot = home.appendingPathComponent(
@@ -963,6 +975,31 @@ private func extractAuthenticatedMacBoxRelease(
     // Production installation remains locked until the
     // independent release-authentication path is complete.
     try validateProductionApp(target)
+
+    #if !MACBOX_MIGRATION_LAB
+
+    if !fm.isWritableFile(atPath: targetParent.path) {
+
+        guard target.path == "/Applications/MacBox.app" else {
+            throw fail(
+                "Unsupported protected MacBox installation location."
+            )
+        }
+
+        try waitForParentExit(parentPID)
+
+        try runAdministratorAuthorizedInstallation(
+            manifest: manifestURL,
+            signature: signatureURL,
+            archive: archiveURL,
+            mode: "install",
+            operation: "update"
+        )
+
+        return
+    }
+
+    #endif
 
     let siblings = try fm.contentsOfDirectory(
         atPath: targetParent.path
@@ -1337,8 +1374,943 @@ private func runLegacyMigrationLaboratory() throws {
 
 #endif
 
+// Read-only validation for migrating the original Moonif MacBox.
+// No application is modified by this function.
+
+// The laboratory and production installer share the same
+// transaction but cannot select arbitrary destinations.
+private func legacyMigrationDestination() -> URL {
+
+    #if MACBOX_MIGRATION_LAB
+
+    return fm.homeDirectoryForCurrentUser
+        .appendingPathComponent(
+            "MacBox-ReleaseTest/LegacyMigration-Shared-Lab/MacBox.app",
+            isDirectory: true
+        ).standardizedFileURL
+
+    #else
+
+    return URL(
+        fileURLWithPath: "/Applications/MacBox.app",
+        isDirectory: true
+    ).standardizedFileURL
+
+    #endif
+}
+
+private func preflightLegacyProductionMigration(
+    manifestURL: URL,
+    signatureURL: URL,
+    archiveURL: URL
+) throws -> String {
+
+    let original = legacyMigrationDestination()
+
+    guard original.path ==
+            original.resolvingSymlinksInPath().path else {
+        throw fail("Unsafe original MacBox location.")
+    }
+
+    try validateApp(
+        original,
+        expectedBundleID: "Moonif.MacBox"
+    )
+
+    // Verify the original application has a valid code signature.
+    let check = Process()
+
+    check.executableURL = URL(
+        fileURLWithPath: "/usr/bin/codesign"
+    )
+
+    check.arguments = [
+        "--verify",
+        "--deep",
+        "--strict",
+        original.path
+    ]
+
+    check.standardOutput = FileHandle.nullDevice
+    check.standardError = FileHandle.nullDevice
+
+    try check.run()
+    check.waitUntilExit()
+
+    guard check.terminationStatus == 0 else {
+        throw fail("Original MacBox signature verification failed.")
+    }
+
+    print("PASS: Original Moonif MacBox verified.")
+
+    // Authenticate the independently signed replacement.
+    let version = try verifySignedMacBoxReleasePackage(
+        manifestURL: manifestURL,
+        signatureURL: signatureURL,
+        archiveURL: archiveURL
+    )
+
+    // Verify the archive structure without extracting it.
+    try validateProductionReleaseZIP(at: archiveURL)
+
+    print("PASS: Replacement release authenticated.")
+    print("PASS: Replacement archive structure validated.")
+    print("PASS: Production legacy migration preflight completed.")
+
+    return version
+}
+
+// Dedicated migration transaction for the original Moonif MacBox.
+// This is separate from ordinary authenticated self-updates.
+// It may only replace /Applications/MacBox.app.
+private func runProductionLegacyMigration(
+    parentPID: pid_t,
+    manifestURL: URL,
+    signatureURL: URL,
+    archiveURL: URL
+) throws {
+
+    // Elevation is deliberately disabled until the
+    // dedicated administrator-authorisation path is ready.
+    guard geteuid() != 0 else {
+        throw fail("Privileged migration is not enabled yet.")
+    }
+
+    let target = legacyMigrationDestination()
+    let parent = target.deletingLastPathComponent()
+
+    // Require the expected staged-release filename convention.
+    let archive = archiveURL.standardizedFileURL
+    let manifest = manifestURL.standardizedFileURL
+    let signature = signatureURL.standardizedFileURL
+    let base = archive.deletingPathExtension()
+
+
+    // Identify the account that owns the downloaded package.
+    // This also works when the installer is running as root.
+    guard let archiveAttributes = try? fm.attributesOfItem(
+            atPath: archive.path
+          ),
+          let ownerNumber = archiveAttributes[
+            .ownerAccountID
+          ] as? NSNumber,
+          let account = getpwuid(
+            uid_t(ownerNumber.uint32Value)
+          ),
+          let homePointer = account.pointee.pw_dir else {
+
+        throw fail("Cannot identify release staging owner.")
+    }
+
+    let accountHome = URL(
+        fileURLWithPath: String(cString: homePointer),
+        isDirectory: true
+    ).standardizedFileURL
+
+    let expectedStagingRoot = accountHome
+        .appendingPathComponent(
+            "Library/Caches/io.github.settloe99.MacBox/StagedUpdates",
+            isDirectory: true
+        ).standardizedFileURL
+
+    guard isRealDirectory(expectedStagingRoot),
+          expectedStagingRoot.path ==
+            expectedStagingRoot.resolvingSymlinksInPath().path,
+          archive.deletingLastPathComponent() ==
+            expectedStagingRoot else {
+
+        throw fail("Release files are outside trusted staging.")
+    }
+
+    // All three files must be regular, owned by the same
+    // user, and free from symbolic-link redirection.
+    for input in [archive, manifest, signature] {
+
+        guard input.deletingLastPathComponent() ==
+                expectedStagingRoot,
+              input.path ==
+                input.resolvingSymlinksInPath().path,
+              let attributes = try? fm.attributesOfItem(
+                atPath: input.path
+              ),
+              attributes[.type] as? FileAttributeType ==
+                .typeRegular,
+              let owner = attributes[
+                .ownerAccountID
+              ] as? NSNumber,
+              owner.uint32Value ==
+                ownerNumber.uint32Value else {
+
+            throw fail("Unsafe authenticated release input.")
+        }
+    }
+
+    guard archive.pathExtension.lowercased() == "zip",
+          UUID(uuidString: base.lastPathComponent) != nil,
+          manifest == base.appendingPathExtension("manifest"),
+          signature == base.appendingPathExtension("sig"),
+          parent.path == parent.resolvingSymlinksInPath().path,
+          isRealDirectory(parent),
+          isRealDirectory(target),
+          target.path == target.resolvingSymlinksInPath().path else {
+        throw fail("Unsafe legacy migration destination or input.")
+    }
+
+    // Authenticate the signed release and verify the original
+    // Moonif application before creating any installation files.
+    _ = try preflightLegacyProductionMigration(
+        manifestURL: manifest,
+        signatureURL: signature,
+        archiveURL: archive
+    )
+
+    // An interrupted earlier migration must be recovered first.
+    #if !MACBOX_MIGRATION_LAB
+
+    if !fm.isWritableFile(atPath: parent.path) {
+
+        guard target.path == "/Applications/MacBox.app" else {
+            throw fail("Unsupported protected migration destination.")
+        }
+
+        try waitForParentExit(parentPID)
+
+        try runAdministratorAuthorizedInstallation(
+            manifest: manifest,
+            signature: signature,
+            archive: archive,
+            mode: "install",
+            operation: "migration"
+        )
+
+        return
+    }
+
+    #endif
+
+    let siblings = try fm.contentsOfDirectory(atPath: parent.path)
+
+    guard !siblings.contains(where: {
+        $0.hasPrefix(".MacBox-Legacy-parked-")
+    }) else {
+        throw fail("An interrupted legacy migration requires recovery.")
+    }
+
+    let identifier = UUID().uuidString
+
+    let workspace = parent.appendingPathComponent(
+        ".MacBox-Legacy-work-\(identifier)",
+        isDirectory: true
+    )
+
+    let staged = workspace.appendingPathComponent(
+        "MacBox.app",
+        isDirectory: true
+    )
+
+    let parked = parent.appendingPathComponent(
+        ".MacBox-Legacy-parked-\(identifier).app",
+        isDirectory: true
+    )
+
+    let rejected = parent.appendingPathComponent(
+        ".MacBox-Legacy-rejected-\(identifier).app",
+        isDirectory: true
+    )
+
+    // Never overwrite existing transaction files.
+    guard !fm.fileExists(atPath: workspace.path),
+          !fm.fileExists(atPath: parked.path),
+          !fm.fileExists(atPath: rejected.path) else {
+        throw fail("Legacy migration transaction path already exists.")
+    }
+
+    try fm.createDirectory(
+        at: workspace,
+        withIntermediateDirectories: false,
+        attributes: [.posixPermissions: 0o700]
+    )
+
+    defer {
+        try? fm.removeItem(at: workspace)
+    }
+
+    // Verify and extract the authenticated application.
+    let authenticated = try extractAuthenticatedMacBoxRelease(
+        manifestURL: manifest,
+        signatureURL: signature,
+        archiveURL: archive,
+        workspace: workspace
+    )
+
+    guard authenticated.standardizedFileURL ==
+            staged.standardizedFileURL else {
+        throw fail("Unexpected authenticated application location.")
+    }
+
+    try validateProductionApp(staged)
+
+    // Wait until the initiating MacBox process has exited.
+    try waitForParentExit(parentPID)
+
+    // Recheck the original application before replacement.
+    // The ordinary updater's productionID check is deliberately
+    // not used for the original Moonif application.
+    try validateApp(
+        target,
+        expectedBundleID: "Moonif.MacBox"
+    )
+
+    let originalCheck = Process()
+    originalCheck.executableURL = URL(
+        fileURLWithPath: "/usr/bin/codesign"
+    )
+    originalCheck.arguments = [
+        "--verify", "--deep", "--strict", target.path
+    ]
+    originalCheck.standardOutput = FileHandle.nullDevice
+    originalCheck.standardError = FileHandle.nullDevice
+
+    try originalCheck.run()
+    originalCheck.waitUntilExit()
+
+    guard originalCheck.terminationStatus == 0 else {
+        throw fail("Original Moonif MacBox code signature invalid.")
+    }
+
+    let backups = parent.appendingPathComponent(
+        ".MacBox-Legacy-backups",
+        isDirectory: true
+    )
+
+    if fm.fileExists(atPath: backups.path) {
+        guard isRealDirectory(backups) else {
+            throw fail("Unsafe legacy backup directory.")
+        }
+    } else {
+        try fm.createDirectory(
+            at: backups,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+    }
+
+    let backup = backups.appendingPathComponent(
+        "MacBox-\(identifier).app",
+        isDirectory: true
+    )
+
+    // Preserve the original before modifying its location.
+    try fm.copyItem(at: target, to: backup)
+
+    try validateApp(
+        backup,
+        expectedBundleID: "Moonif.MacBox"
+    )
+
+    var originalParked = false
+    var replacementInstalled = false
+
+    do {
+        try fm.moveItem(at: target, to: parked)
+        originalParked = true
+
+        try fm.moveItem(at: staged, to: target)
+        replacementInstalled = true
+
+        // Check the replacement at its final location.
+        try validateProductionApp(target)
+
+        // When running without elevation, relaunch directly.
+        // Elevated installations will require a separate
+        // user-session relaunch step.
+        #if MACBOX_MIGRATION_LAB
+
+        print("PASS: Laboratory relaunch deliberately suppressed.")
+
+        #else
+
+        try relaunch(target)
+
+        #endif
+
+        // Retain the independent backup.
+        do {
+            try fm.removeItem(at: parked)
+        } catch {
+            NSLog(
+                "MacBoxMigration: Retained parked original at %@",
+                parked.path
+            )
+        }
+
+        print("PASS: Production legacy migration completed.")
+        print("Original application backup: \(backup.path)")
+        print("Maintained application: \(target.path)")
+
+    } catch {
+        let installationError = error
+
+        if originalParked {
+            do {
+                if replacementInstalled &&
+                    fm.fileExists(atPath: target.path) {
+                    try fm.moveItem(at: target, to: rejected)
+                }
+
+                try fm.moveItem(at: parked, to: target)
+
+                print("PASS: Original Moonif application restored.")
+
+            } catch {
+                throw fail(
+                    "Legacy migration and rollback failed. " +
+                    "The original may remain at \(parked.path). " +
+                    "Rollback error: \(error.localizedDescription)"
+                )
+            }
+        }
+
+        throw installationError
+    }
+}
+
+private func runAdministratorAuthorizedCommand(
+    _ executable: String,
+    arguments: [String]
+) throws -> String {
+
+    // Quote every argument independently for the POSIX shell.
+    func shellQuote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(
+            of: "'",
+            with: "'\\''"
+        ) + "'"
+    }
+
+    // This bridge is restricted to the system shell.
+    // Never elevate the MacBox helper executable itself.
+    guard executable == "/bin/sh" else {
+        throw fail("Unsupported administrator command.")
+    }
+
+    let command = ([executable] + arguments)
+        .map { shellQuote($0) }
+        .joined(separator: " ")
+
+    let appleScript = """
+    on run argv
+        with timeout of 600 seconds
+            do shell script (item 1 of argv) with administrator privileges with prompt "MacBox requires administrator permission to install an authenticated application update."
+        end timeout
+    end run
+    """
+
+    let process = Process()
+
+    process.executableURL = URL(
+        fileURLWithPath: "/usr/bin/osascript"
+    )
+
+    process.arguments = [
+        "-e",
+        appleScript,
+        command
+    ]
+
+    let output = Pipe()
+    process.standardOutput = output
+    process.standardError = output
+
+    try process.run()
+
+    let data = output.fileHandleForReading
+        .readDataToEndOfFile()
+
+    process.waitUntilExit()
+
+    let result = String(
+        data: data,
+        encoding: .utf8
+    ) ?? ""
+
+    guard process.terminationStatus == 0 else {
+        throw fail(
+            "Administrator operation was cancelled or failed: " +
+            result.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            )
+        )
+    }
+
+    return result.trimmingCharacters(
+        in: .whitespacesAndNewlines
+    )
+}
+
+
+
+
+// Exercise privileged installation against a fixed,
+// root-owned laboratory. Never target /Applications.
+private func runAdministratorAuthorizedInstallation(
+    manifest: URL,
+    signature: URL,
+    archive: URL,
+    mode: String,
+    operation: String = "migration"
+) throws {
+
+    guard geteuid() != 0,
+          mode == "install" || mode == "rollback" else {
+        throw fail("Invalid protected migration request.")
+    }
+
+    // Initial verification remains unprivileged.
+    _ = try verifySignedMacBoxReleasePackage(
+        manifestURL: manifest,
+        signatureURL: signature,
+        archiveURL: archive
+    )
+
+    guard operation == "migration" ||
+            operation == "update" else {
+        throw fail("Unsupported protected operation.")
+    }
+
+    let expectedID = operation == "migration"
+        ? "Moonif.MacBox"
+        : "io.github.settloe99.MacBox"
+
+    let validatedSHA256 = try validateProductionReleaseZIP(
+        at: archive
+    )
+
+    // Only this fixed shell routine receives elevation.
+    #if MACBOX_MIGRATION_LAB
+
+    let installationParentPath =
+        "/private/var/tmp/io.github.settloe99.MacBox-Authorization-Lab"
+
+    #else
+
+    guard mode == "install" else {
+        throw fail("Laboratory failure simulation is unavailable.")
+    }
+
+    let installationParentPath = "/Applications"
+
+    #endif
+
+    let script = #"""
+set -eu
+umask 077
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+
+LAB="__MACBOX_INSTALLATION_PARENT__"
+TARGET="$LAB/MacBox.app"
+
+UID_NUMBER="$1"
+MANIFEST="$2"
+SIGNATURE="$3"
+ARCHIVE="$4"
+MODE="$5"
+VALIDATED_SHA="$6"
+EXPECTED_ID="$7"
+
+case "$EXPECTED_ID" in
+    Moonif.MacBox|io.github.settloe99.MacBox) ;;
+    *) exit 1 ;;
+esac
+
+test "$(/usr/bin/id -u)" = "0"
+test -d "$LAB"
+test ! -L "$LAB"
+test "$(/usr/bin/stat -f '%u' "$LAB")" = "0"
+if [ "$LAB" = "/Applications" ]; then
+
+    case "$(/usr/bin/stat -f '%Lp' "$LAB")" in
+        755|775) ;;
+        *) exit 1 ;;
+    esac
+
+    case "$(/usr/bin/stat -f '%Sg' "$LAB")" in
+        admin|wheel) ;;
+        *) exit 1 ;;
+    esac
+
+    test "$MODE" = "install"
+
+    # Only elevate when the initiating user cannot
+    # write to the approved application directory.
+    /usr/bin/sudo -n -u "#$UID_NUMBER" \
+        /bin/test ! -w "$LAB"
+
+else
+    test "$(/usr/bin/stat -f '%Lp' "$LAB")" = "755"
+fi
+
+case "$UID_NUMBER" in
+    ''|*[!0-9]*|0) exit 1 ;;
+esac
+
+case "$MODE" in
+    install|rollback) ;;
+    *) exit 1 ;;
+esac
+
+validate_app() {
+    APP="$1"
+    EXPECTED_ID="$2"
+
+    test -d "$APP"
+    test ! -L "$APP"
+
+    ACTUAL_ID=$(/usr/libexec/PlistBuddy \
+        -c "Print CFBundleIdentifier" \
+        "$APP/Contents/Info.plist")
+
+    test "$ACTUAL_ID" = "$EXPECTED_ID"
+
+    /usr/bin/codesign --verify --deep --strict "$APP"
+}
+
+validate_app "$TARGET" "$EXPECTED_ID"
+
+WORK=$(/usr/bin/mktemp -d "$LAB/.MacBox-Work.XXXXXX")
+PARKED="$WORK/Original.app"
+
+ORIGINAL_PARKED=0
+REPLACEMENT_INSTALLED=0
+COMMITTED=0
+
+finish() {
+    STATUS=$?
+    trap - 0
+    set +e
+
+    if [ "$COMMITTED" = "0" ] &&
+       [ "$ORIGINAL_PARKED" = "1" ]; then
+
+        if [ "$REPLACEMENT_INSTALLED" = "1" ]; then
+            if ! /bin/mv "$TARGET" "$WORK/Rejected.app"; then
+                echo "FAIL: Cannot park rejected replacement."
+                echo "Recovery workspace: $WORK"
+                exit 1
+            fi
+        fi
+
+        if ! /bin/mv "$PARKED" "$TARGET"; then
+            echo "FAIL: Rollback could not restore original."
+            echo "Recovery workspace: $WORK"
+            exit 1
+        fi
+
+        if ! validate_app "$TARGET" "$EXPECTED_ID"; then
+            echo "FAIL: Restored application failed verification."
+            exit 1
+        fi
+
+        echo "PASS: Original application restored by rollback."
+    fi
+
+    /bin/rm -rf "$WORK"
+    exit "$STATUS"
+}
+
+trap finish 0
+
+# Read release inputs with the initiating user's permissions,
+# not root's permissions. Store copies in root-private storage.
+copy_input() {
+    INPUT="$1"
+    OUTPUT="$2"
+    LIMIT="$3"
+
+    case "$INPUT" in
+        /*) ;;
+        *) exit 1 ;;
+    esac
+
+    (
+        ulimit -f "$LIMIT"
+        /usr/bin/sudo -n -u "#$UID_NUMBER" \
+            /bin/cat "$INPUT"
+    ) > "$OUTPUT"
+}
+
+copy_input "$MANIFEST" "$WORK/release.manifest" 8
+copy_input "$SIGNATURE" "$WORK/release.sig" 8
+copy_input "$ARCHIVE" "$WORK/release.zip" 1048576
+
+test "$(/usr/bin/stat -f '%z' "$WORK/release.manifest")" -le 4096
+test "$(/usr/bin/stat -f '%z' "$WORK/release.sig")" -le 4096
+test "$(/usr/bin/stat -f '%z' "$WORK/release.zip")" -le 536870912
+
+# The key is embedded in the helper, not obtained from
+# GitHub or from the user-writable release directory.
+cat > "$WORK/public.pem" <<'MACBOX_PINNED_KEY'
+-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE8dtvY4qnZXg3qm3sVB53g8ht2WQh
+wDY2RdYXa4ED5zI30K1f42EpSwXqF9nt8Hpdcuzv3cq/sbZcEnKV7rK9uA==
+-----END PUBLIC KEY-----
+MACBOX_PINNED_KEY
+
+# Independently authenticate the root-owned package.
+/usr/bin/openssl dgst -sha256 \
+    -verify "$WORK/public.pem" \
+    -signature "$WORK/release.sig" \
+    "$WORK/release.manifest"
+
+EXPECTED_SHA=$(/usr/bin/awk -F= \
+    '$1 == "sha256" {print $2}' \
+    "$WORK/release.manifest")
+
+VERSION=$(/usr/bin/awk -F= \
+    '$1 == "version" {print $2}' \
+    "$WORK/release.manifest")
+
+printf '%s\n' "$EXPECTED_SHA" |
+    /usr/bin/grep -Eq '^[0-9a-f]{64}$'
+
+printf '%s\n' "$VERSION" |
+    /usr/bin/grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'
+
+ACTUAL_SHA=$(/usr/bin/shasum -a 256 \
+    "$WORK/release.zip" | /usr/bin/awk '{print $1}')
+
+test "$ACTUAL_SHA" = "$EXPECTED_SHA"
+
+# The privileged installer must receive the exact bytes
+# inspected by the unprivileged ZIP validator.
+printf '%s\n' "$VALIDATED_SHA" |
+    /usr/bin/grep -Eq '^[0-9a-f]{64}$'
+
+test "$ACTUAL_SHA" = "$VALIDATED_SHA"
+
+echo "PASS: Privileged ZIP matches inspected archive."
+
+echo "PASS: Privileged release authentication succeeded."
+
+# Extract only the independently authenticated package.
+/bin/mkdir "$WORK/Extracted"
+
+/usr/bin/ditto -x -k \
+    "$WORK/release.zip" \
+    "$WORK/Extracted"
+
+NEW="$WORK/Extracted/MacBox.app"
+
+validate_app "$NEW" "io.github.settloe99.MacBox"
+
+NEW_VERSION=$(/usr/libexec/PlistBuddy \
+    -c "Print CFBundleShortVersionString" \
+    "$NEW/Contents/Info.plist")
+
+test "$NEW_VERSION" = "$VERSION"
+
+# Ordinary updates must advance the installed version.
+# Legacy migration may replace an equivalent version.
+if [ "$EXPECTED_ID" = "io.github.settloe99.MacBox" ]; then
+
+    OLD_VERSION=$(/usr/libexec/PlistBuddy \
+        -c "Print CFBundleShortVersionString" \
+        "$TARGET/Contents/Info.plist")
+
+    for CHECK_VERSION in "$OLD_VERSION" "$NEW_VERSION"; do
+        printf '%s\n' "$CHECK_VERSION" |
+            /usr/bin/grep -Eq '^[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9}$'
+    done
+
+    if ! /usr/bin/awk \
+        -v old="$OLD_VERSION" \
+        -v new="$NEW_VERSION" '
+        BEGIN {
+            split(old, a, ".")
+            split(new, b, ".")
+
+            for (i = 1; i <= 3; i++) {
+                if (b[i] + 0 > a[i] + 0) exit 0
+                if (b[i] + 0 < a[i] + 0) exit 1
+            }
+
+            exit 1
+        }
+    '; then
+        echo "FAIL: Protected update must advance the version."
+        exit 1
+    fi
+
+    echo "PASS: Protected update advances installed version."
+fi
+
+UNSAFE=$(/usr/bin/find "$NEW" \
+    ! -type f ! -type d -print)
+
+test -z "$UNSAFE"
+
+/usr/sbin/chown -R root:wheel "$NEW"
+/bin/chmod -R a+rX,go-w "$NEW"
+
+validate_app "$NEW" "io.github.settloe99.MacBox"
+
+# Do not replace a running production application.
+if [ "$LAB" = "/Applications" ]; then
+
+    if /usr/bin/pgrep -f \
+        '^/Applications/MacBox\.app/Contents/MacOS/MacBox([[:space:]]|$)' \
+        >/dev/null; then
+
+        echo "FAIL: MacBox is still running."
+        exit 1
+
+    else
+        STATUS=$?
+        test "$STATUS" = "1"
+    fi
+
+fi
+
+# Preserve an independent backup in root-private storage.
+BACKUPS=$(/usr/bin/mktemp -d \
+    "$LAB/.MacBox-Legacy-backup.XXXXXX")
+
+/usr/bin/ditto "$TARGET" "$BACKUPS/MacBox.app"
+
+validate_app "$BACKUPS/MacBox.app" "$EXPECTED_ID"
+
+echo "PASS: Independent original backup verified."
+
+# Transactional replacement.
+/bin/mv "$TARGET" "$PARKED"
+ORIGINAL_PARKED=1
+
+/bin/mv "$NEW" "$TARGET"
+REPLACEMENT_INSTALLED=1
+
+validate_app "$TARGET" "io.github.settloe99.MacBox"
+
+/usr/bin/sudo -n -u "#$UID_NUMBER" \
+    /usr/bin/codesign --verify --deep --strict "$TARGET"
+
+/usr/bin/sudo -n -u "#$UID_NUMBER" \
+    /bin/test -x "$TARGET/Contents/MacOS/MacBox"
+
+echo "PASS: Installed application verified as normal user."
+
+# Deliberate failure is available only in this laboratory.
+if [ "$MODE" = "rollback" ]; then
+    echo "TEST: Deliberately triggering rollback."
+    exit 42
+fi
+
+if [ "$LAB" = "/Applications" ]; then
+
+    # Switch both bootstrap context and user identity.
+    # MacBox must never run as root.
+    /bin/launchctl asuser "$UID_NUMBER" \
+        /usr/bin/sudo -n -H -u "#$UID_NUMBER" \
+        /usr/bin/open -n "$TARGET"
+
+    echo "PASS: User-session relaunch requested."
+
+else
+
+    echo "PASS: Relaunch deliberately suppressed in laboratory."
+
+fi
+
+COMMITTED=1
+
+echo "PASS: Protected application replacement succeeded."
+echo "Independent backup: $BACKUPS/MacBox.app"
+"""#.replacingOccurrences(
+        of: "__MACBOX_INSTALLATION_PARENT__",
+        with: installationParentPath
+    )
+
+    let result = try runAdministratorAuthorizedCommand(
+        "/bin/sh",
+        arguments: [
+            "-c",
+            script,
+            "macbox-protected-lab",
+            String(getuid()),
+            manifest.path,
+            signature.path,
+            archive.path,
+            mode,
+            validatedSHA256,
+            expectedID
+        ]
+    )
+
+    print(result)
+}
+
+
+
 private func main() throws {
     let args = Array(CommandLine.arguments.dropFirst())
+
+    #if MACBOX_MIGRATION_LAB
+
+    if args.count == 5,
+       (args[0] == "--migrate-protected-lab" ||
+        args[0] == "--update-protected-lab") {
+
+        try runAdministratorAuthorizedInstallation(
+            manifest: URL(fileURLWithPath: args[1]),
+            signature: URL(fileURLWithPath: args[2]),
+            archive: URL(fileURLWithPath: args[3]),
+            mode: args[4],
+            operation: args[0] == "--update-protected-lab"
+                ? "update"
+                : "migration"
+        )
+
+        return
+    }
+
+    #endif
+
+
+
+    #if MACBOX_MIGRATION_LAB
+
+    if args.count == 5,
+       args[0] == "--migrate-legacy-shared-lab",
+       let parentPID = Int32(args[1]),
+       parentPID > 1 {
+
+        try runProductionLegacyMigration(
+            parentPID: parentPID,
+            manifestURL: URL(fileURLWithPath: args[2]),
+            signatureURL: URL(fileURLWithPath: args[3]),
+            archiveURL: URL(fileURLWithPath: args[4])
+        )
+
+        return
+    }
+
+    #endif
+
+
+
+    if args.count == 4,
+       args[0] == "--preflight-legacy-migration" {
+
+        _ = try preflightLegacyProductionMigration(
+            manifestURL: URL(fileURLWithPath: args[1]),
+            signatureURL: URL(fileURLWithPath: args[2]),
+            archiveURL: URL(fileURLWithPath: args[3])
+        )
+
+        return
+    }
+
+
 
     let root = fm.homeDirectoryForCurrentUser
         .appendingPathComponent("MacBox-ReleaseTest")
@@ -1400,6 +2372,39 @@ private func main() throws {
 
     if args == ["--migrate-legacy-lab"] {
         try runLegacyMigrationLaboratory()
+        return
+    }
+
+    #endif
+
+    #if !DEBUG && !MACBOX_RELEASE_TEST && !MACBOX_MIGRATION_LAB
+
+    // Dedicated production migration command.
+    // Ordinary self-updating retains its separate command.
+    if args.count == 5,
+       args[0] == "--migrate-legacy-production",
+       let parentPID = Int32(args[1]),
+       parentPID > 1 {
+
+        let manifest = URL(
+            fileURLWithPath: args[2]
+        ).standardizedFileURL
+
+        let signature = URL(
+            fileURLWithPath: args[3]
+        ).standardizedFileURL
+
+        let archive = URL(
+            fileURLWithPath: args[4]
+        ).standardizedFileURL
+
+        try runProductionLegacyMigration(
+            parentPID: parentPID,
+            manifestURL: manifest,
+            signatureURL: signature,
+            archiveURL: archive
+        )
+
         return
     }
 

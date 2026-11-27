@@ -44,11 +44,30 @@ extension JenkinsResponseObject {
             assets.append(asset)
         }
         
+        // Use the first available change description.
+        // Jenkins may populate either comment or msg.
+        let releaseNotes = changeSets?
+            .flatMap { $0.items ?? [] }
+            .compactMap { item -> String? in
+                let comment = item.comment?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+
+                if let comment = comment, !comment.isEmpty {
+                    return comment
+                }
+
+                let msg = item.msg?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+
+                return (msg?.isEmpty == false) ? msg : nil
+            }
+            .first
+
         let githubObject = GithubResponseObject(
             url: url,
             html_url: nil,
             tag_name: id,
-            body: changeSets?.first?.items?.first?.comment,
+            body: releaseNotes,
             published_at: formattedDate,
             sha: nil,
             assets: assets,

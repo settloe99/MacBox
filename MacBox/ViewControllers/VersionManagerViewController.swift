@@ -352,6 +352,27 @@ class VersionManagerViewController: NSViewController {
 
         let versionInfoObject = MainViewController.instance.versionInfoObject
 
+        defer {
+            let installedVersion = Bundle.main.object(
+                forInfoDictionaryKey: "CFBundleShortVersionString"
+            ) as? String
+
+            let comparison = VersionInfoObject.macBoxReleaseComparison(
+                installed: installedVersion,
+                published: versionInfoObject.macboxUpdateObject?.tag_name
+            )
+
+            let showReleaseNotes = comparison == .orderedDescending
+
+            if !showReleaseNotes {
+                macboxReleaseNoteTextView.string = ""
+            }
+
+            macboxReleaseNoteTextView.isHidden = !showReleaseNotes
+            macboxReleaseNoteTextView.enclosingScrollView?.isHidden =
+                !showReleaseNotes
+        }
+
         // No published release was returned by the update feed.
         guard let release = versionInfoObject.macboxUpdateObject else {
             macboxUpdateDateTextField.stringValue = "Release unavailable"
@@ -492,12 +513,22 @@ class VersionManagerViewController: NSViewController {
                 forInfoDictionaryKey: "CFBundleShortVersionString"
             ) as? String
 
-            if installedVersion == onlineVersion {
-                // Installed version matches the published release.
+            let comparison = VersionInfoObject.macBoxReleaseComparison(
+                installed: installedVersion,
+                published: onlineVersion
+            )
+
+            if comparison == nil {
+                // Invalid or unavailable version information.
+                macboxUpdateButton.isHidden = true
+                macboxUpdateCheckImageView.isHidden = true
+
+            } else if comparison != .orderedDescending {
+                // Installed version matches or exceeds the published release.
                 macboxUpdateButton.isHidden = true
                 macboxUpdateCheckImageView.isHidden = false
             } else {
-                // A different published release is available.
+                // A strictly newer published release is available.
                 macboxUpdateButton.isHidden = false
                 macboxUpdateCheckImageView.isHidden = true
             }
@@ -1744,6 +1775,22 @@ class VersionManagerViewController: NSViewController {
             alert.runModal()
         }
 
+        // Never download an older or equivalent MacBox release.
+        let installedVersion = Bundle.main.object(
+            forInfoDictionaryKey: "CFBundleShortVersionString"
+        ) as? String
+
+        guard VersionInfoObject.macBoxReleaseComparison(
+            installed: installedVersion,
+            published: versionInfoObject.macboxUpdateObject?.tag_name
+        ) == .orderedDescending else {
+
+            reject(
+                "No newer MacBox release is available."
+            )
+            return
+        }
+
         let matchingAssets: [(asset: GithubAsset, url: URL)] = (
             versionInfoObject.macboxUpdateObject?.assets ?? []
         ).compactMap { asset in
@@ -2917,6 +2964,20 @@ class VersionManagerViewController: NSViewController {
 
             // These checks are repeated inside the helper
             // using private copies before installation.
+            let requiresAdministrator =
+                !fm.isWritableFile(
+                    atPath: destination.deletingLastPathComponent().path
+                )
+
+            if requiresAdministrator &&
+                destination.path != "/Applications/MacBox.app" {
+
+                throw fail(
+                    "Automatic administrator-authorised updates " +
+                    "require MacBox to be installed in /Applications."
+                )
+            }
+
             let confirmation = NSAlert()
             confirmation.alertStyle = .warning
             confirmation.messageText = "Install MacBox update?"
@@ -2953,17 +3014,81 @@ class VersionManagerViewController: NSViewController {
 
             // The helper accepts the complete authenticated
             // release, not an independently extracted app.
+            let logDirectory = fm.homeDirectoryForCurrentUser
+                .appendingPathComponent(
+                    "Library/Logs/MacBoxUpdate",
+                    isDirectory: true
+                )
+
+            try fm.createDirectory(
+                at: logDirectory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+
+            let logURL = logDirectory.appendingPathComponent(
+                "\(UUID().uuidString).log"
+            )
+
+            guard fm.createFile(
+                atPath: logURL.path,
+                contents: nil,
+                attributes: [.posixPermissions: 0o600]
+            ) else {
+                throw fail("Could not create MacBox update log.")
+            }
+
+            let log = try FileHandle(forWritingTo: logURL)
+            defer { log.closeFile() }
+
+            let script = #"""
+"$1" --install-production "$2" "$3" "$4" "$5" "$6"
+STATUS=$?
+
+if [ "$STATUS" -ne 0 ]; then
+
+    if /usr/bin/codesign --verify --deep --strict "$6" &&
+       [ "$(/usr/libexec/PlistBuddy \
+       -c 'Print CFBundleIdentifier' \
+       "$6/Contents/Info.plist")" = "io.github.settloe99.MacBox" ]; then
+
+        if /usr/bin/open -n "$6" --args \
+            --macbox-update-failure "$STATUS" "$7"; then
+            exit "$STATUS"
+        fi
+    fi
+
+    /usr/bin/osascript -e \
+        'on run argv
+            display alert "MacBox update failed" message ("Installation log: " & item 1 of argv)
+        end run' "$7"
+
+fi
+
+exit "$STATUS"
+"""#
+
             let updater = Process()
-            updater.executableURL = helper
+
+            updater.executableURL = URL(
+                fileURLWithPath: "/bin/sh"
+            )
 
             updater.arguments = [
-                "--install-production",
+                "-c",
+                script,
+                "macbox-update-launcher",
+                helper.path,
                 String(ProcessInfo.processInfo.processIdentifier),
                 manifest.path,
                 signature.path,
                 archive.path,
-                destination.path
+                destination.path,
+                logURL.path
             ]
+
+            updater.standardOutput = log
+            updater.standardError = log
 
             try updater.run()
 

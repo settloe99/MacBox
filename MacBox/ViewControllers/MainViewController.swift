@@ -1772,7 +1772,10 @@ class MainViewController: NSViewController {
                     ) as? String
 
                     if let installedVersion = installedVersion,
-                       installedVersion != latestVersion {
+                       VersionInfoObject.macBoxReleaseComparison(
+                        installed: installedVersion,
+                        published: latestVersion
+                       ) == .orderedDescending {
                         self.numberOfUpdates += 1
                     }
                 }
