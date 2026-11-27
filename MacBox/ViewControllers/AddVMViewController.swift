@@ -8,7 +8,7 @@
 import Cocoa
 
 class AddVMViewController: NSViewController {
-    
+
     // IBOutlets
     @IBOutlet weak var vmNameTextField: NSTextField!
     @IBOutlet var vmDescriptionTextView: NSTextView!
@@ -20,37 +20,37 @@ class AddVMViewController: NSViewController {
     @IBOutlet weak var vmSpecHDD: NSTextField!
     @IBOutlet weak var vmSpecMachineLogo: NSImageView!
     @IBOutlet weak var vmTemplateShaderOption: NSButton!
-    
+
     // Variables
     private let fileManager = FileManager.default
     var vmTemplateList: [VMTemplate] = []
     var currentVMTemplate: VMTemplate?
-    
+
     let nameTextFieldMaxLimit: Int = 32
 
     // View did load
     override func viewDidLoad() {
         super.viewDidLoad()
-        
+
         // Set delegates
         vmNameTextField.delegate = self
         vmTemplateComboBox.delegate = self
         vmTemplateComboBox.dataSource = self
-        
+
         // Config views
         configView()
-        
+
         // Populate VM templates
         populateVMTemplates()
     }
-    
+
     // View will appear
     override func viewWillAppear() {
         // Remove fullscreen window button
         self.view.window?.styleMask.remove(.fullScreen)
         self.view.window?.styleMask.remove(.resizable)
     }
-    
+
     // Config views initial properties
     private func configView() {
         // Specs text
@@ -65,31 +65,31 @@ class AddVMViewController: NSViewController {
         // Shader option
         vmTemplateShaderOption.isTransparent = true
     }
-    
+
     // Populate VM templates
     private func populateVMTemplates() {
         // Clear list
         vmTemplateList.removeAll()
         // Add default item
         vmTemplateList.append(VMTemplate())
-        
+
         // Add VM templates paths
         var vmTemplateListSort: [VMTemplate] = []
         let vmTemplatesPaths = Bundle.main.paths(forResourcesOfType: nil, inDirectory: "Templates")
         for path in vmTemplatesPaths {
             // Create and add VM template
             var vmTemplate = VMTemplate()
-            
+
             // Set template data paths
             vmTemplate.infoPath = path.appending("/macbox.inf")
             vmTemplate.configPath = path.appending("/86box.cfg")
-            
+
             if fileManager.fileExists(atPath: vmTemplate.infoPath ?? "") {
                 let ini = IniParser()
-                
+
                 let vmTemplateDescription = ini.parseConfig(vmTemplate.infoPath ?? "")["General"]?["Description"] ?? ""
                 let vmTemplateYear = ini.parseConfig(vmTemplate.infoPath ?? "")["General"]?["Year"] ?? ""
-                
+
                 // VM template name
                 vmTemplate.name = vmTemplateDescription
                 // VM template year
@@ -99,7 +99,7 @@ class AddVMViewController: NSViewController {
                     vmTemplate.machineLogo = machineLogo
                 }
             }
-            
+
             vmTemplateListSort.append(vmTemplate)
         }
         // Add and sort VM templates list
@@ -108,20 +108,20 @@ class AddVMViewController: NSViewController {
         // Reload combo box data
         vmTemplateComboBox.reloadData()
     }
-    
+
     // Create VM
     private func createVM(name: String, description: String?, path: String?, logo: String?) -> VM {
         var vm = VM()
-        
+
         // Set VM properties
         vm.name = name
         vm.description = description
         vm.path = path
         vm.logo = logo
-        
+
         return vm
     }
-    
+
     // Set current VM specs
     private func setVMSpecs(vmConfigPath: String) {
         if vmConfigPath != "" {
@@ -133,7 +133,7 @@ class AddVMViewController: NSViewController {
             vmSpecCPU.stringValue = parsedSpecs.cpu
             vmSpecRAM.stringValue = parsedSpecs.ram
             vmSpecHDD.stringValue = parsedSpecs.hdd
-            
+
             // Define machine logo
             if let machineLogo = currentVMTemplate?.machineLogo {
                 vmSpecMachineLogo.image = NSImage(named: machineLogo)
@@ -151,15 +151,44 @@ class AddVMViewController: NSViewController {
             vmSpecMachineLogo.image = nil
         }
     }
-    
+
 // ------------------------------------
 // IBActions
 // ------------------------------------
-    
+
     // Add VM button action
     @IBAction func addVMButtonAction(_ sender: NSButton) {
         #if MACBOX_RELEASE_TEST
-        return
+
+        // Permit only the named compatibility test VM.
+        let expectedRoot = FileManager.default
+            .homeDirectoryForCurrentUser
+            .appendingPathComponent(
+                "MacBox-ReleaseTest",
+                isDirectory: true
+            ).standardizedFileURL
+
+        guard vmNameTextField.stringValue ==
+                "MacBox Compatibility Test",
+              MainViewController.instance.homeDirURL
+                .standardizedFileURL == expectedRoot,
+              expectedRoot.path ==
+                expectedRoot.resolvingSymlinksInPath().path else {
+
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "Release-Test VM restriction"
+            alert.informativeText = """
+            Only the MacBox Compatibility Test VM can be
+            created in the isolated Release-Test directory.
+
+            No virtual machine has been modified.
+            """
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+            return
+        }
+
         #endif
         // Check if VM name was provided
         if vmNameTextField.stringValue.isEmpty {
@@ -167,23 +196,23 @@ class AddVMViewController: NSViewController {
             vmNameTextField.becomeFirstResponder()
             return
         }
-        
+
         // Check if VM name was already taken
         for vmListEntry in MainViewController.instance.vmList {
             if vmNameTextField.stringValue == vmListEntry.name {
                 // Show name taken alert
                 let alert = NSAlert()
-                
+
                 alert.messageText = NSLocalizedString("VM name is already taken!", comment: "")
                 alert.alertStyle = .critical
                 alert.addButton(withTitle: NSLocalizedString("OK", comment: ""))
-                
+
                 let _ = alert.runModal()
-                
+
                 return
             }
         }
-        
+
         // Create a VM and add it to the table view
         var logo: String?
         if vmTemplateComboBox.indexOfSelectedItem > 0 {
@@ -196,10 +225,10 @@ class AddVMViewController: NSViewController {
                 currentVMTemplate?.useShader = true
             }
         }
-        
+
         let vm = createVM(name: vmNameTextField.stringValue, description: vmDescriptionTextView.string, path: nil, logo: logo)
         MainViewController.instance.addVM(vm: vm, vmTemplate: currentVMTemplate)
-        
+
         // Dismiss the add VM tabVC modal view
         if let tabVC = self.parent as? NSTabViewController {
             dismiss(tabVC)
@@ -228,7 +257,7 @@ extension AddVMViewController: NSComboBoxDelegate, NSComboBoxDataSource {
     func numberOfItems(in comboBox: NSComboBox) -> Int {
         return vmTemplateList.count
     }
-    
+
     func comboBox(_ comboBox: NSComboBox, objectValueForItemAt index: Int) -> Any? {
         var vmDescription = ""
         if let vmYear = vmTemplateList[index].year {
@@ -239,7 +268,7 @@ extension AddVMViewController: NSComboBoxDelegate, NSComboBoxDataSource {
         }
         return vmDescription
     }
-    
+
     func comboBoxSelectionDidChange(_ notification: Notification) {
         if vmTemplateComboBox.indexOfSelectedItem >= 0 {
             // Set shader option

@@ -49,3 +49,48 @@ The maintained updater uses an embedded public key to authenticate release manif
 MacBox was originally created by [Moonif](https://github.com/Moonif/MacBox). This fork preserves the original project's attribution and licence.
 
 See [LICENSE](LICENSE) for licence terms.
+
+## MacBox 0.6.5
+
+This release continues the maintenance of MacBox, originally
+created by Moonif and now maintained by settloe99.
+
+### Improvements
+
+- Universal MacBox application and external updater helper,
+  supporting Intel and Apple Silicon architectures.
+- Automatic migration from the original Moonif MacBox installation.
+- Preservation of existing virtual machines and missing legacy
+  application preferences.
+- Administrator-authorised updates for protected installations
+  at `/Applications/MacBox.app`.
+- Transactional application replacement with backup and rollback.
+- Independent signed-release authentication and SHA-256 verification.
+- Hardened ZIP archive validation.
+- Improved experimental 86Box release descriptions.
+- Correct numeric version comparisons and downgrade prevention.
+- Release notes hidden when MacBox is up to date.
+- Updated application attribution.
+
+### Compatibility and distribution
+
+The minimum deployment target remains macOS 12.0.
+
+MacBox is distributed with ad-hoc code signing and independently
+authenticated release packages. It is not Apple Developer ID
+signed or notarised.
+
+macOS may require initial approval through Privacy & Security.
+
+### Validation
+
+Production migration, application relaunch and VM preservation
+have been tested on Apple Silicon.
+
+Intel helper execution has been tested through Rosetta.
+Native Intel hardware and all supported macOS versions have
+not been independently tested.
+
+Administrator-authorised migration, replacement and rollback
+have passed isolated protected-installation tests. The complete
+elevated production UI workflow has not been independently tested.

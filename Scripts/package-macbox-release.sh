@@ -2,7 +2,7 @@
 set -euo pipefail
 umask 077
 
-VERSION="0.6.4"
+VERSION="0.6.5"
 ROOT="$HOME/MacBox-ReleaseTest"
 OUTPUT="$ROOT/Release-Staging/v$VERSION"
 DERIVED="$HOME/Developer/MacBox-Production-Unsigned-DerivedData"
@@ -97,6 +97,10 @@ if [ ! -x "$HELPER" ]; then
     echo "FAIL: Embedded updater helper missing."
     exit 1
 fi
+
+# Application resources must remain readable by
+# normal users after installation.
+chmod -R a+rX,go-w "$APP"
 
 codesign --force --sign - "$HELPER"
 codesign --force --sign - --options runtime "$APP"
