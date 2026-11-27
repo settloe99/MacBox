@@ -2,7 +2,7 @@
 set -euo pipefail
 umask 077
 
-VERSION="0.6.5"
+VERSION="0.6.6"
 ROOT="$HOME/MacBox-ReleaseTest"
 OUTPUT="$ROOT/Release-Staging/v$VERSION"
 DERIVED="$HOME/Developer/MacBox-Production-Unsigned-DerivedData"
