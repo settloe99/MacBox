@@ -74,12 +74,36 @@ class VersionManagerViewController: NSViewController {
         case macbox
     }
 
+    // MARK: - 86Box Assets
+
+    @IBOutlet private weak var assetsUpdateButton: NSButton!
+    @IBOutlet private weak var assetsUpdateCheckImageView: NSImageView!
+    @IBOutlet private weak var assetsUpdateStatusTextField: NSTextField!
+    @IBOutlet private weak var assetsUpdateProgressIndicator: NSProgressIndicator!
+    @IBOutlet private weak var assetsIconImageView: NSImageView!
+
+    private var assetsStatus: AssetsInstaller.UpdateStatus?
+    private var assetsBusy = false
+    private var assetsRefreshPending = false
+    private var assetsUpdatedEmulatorURL: URL?
+    private var assetsDownloadProgressID: UUID?
+
     // View did load
     override func viewDidLoad() {
         super.viewDidLoad()
 
         // Config views
         configView()
+
+        // Configure the 86Box Assets panel.
+        assetsIconImageView.image = NSImage(
+            named: NSImage.Name("86BoxAssets")
+        )
+
+        assetsIconImageView.contentTintColor = nil
+        assetsIconImageView.imageScaling = .scaleProportionallyUpOrDown
+
+        refreshAssetsStatus()
     }
 
     // View will appear
@@ -293,6 +317,461 @@ class VersionManagerViewController: NSViewController {
                 #endif
 
         }
+
+    // MARK: - 86Box Assets installation
+
+    @IBAction private func assetsUpdateButtonAction(
+        _ sender: NSButton
+    ) {
+
+        #if DEBUG && !MACBOX_RELEASE_TEST
+
+        return
+
+        #else
+
+        guard !assetsBusy,
+              emulatorUpdateProgressIndicator.isHidden,
+              let status = assetsStatus else {
+            return
+        }
+
+        switch status {
+
+        case .install, .update:
+            break
+
+        default:
+            return
+        }
+
+        let emulatorURL = assetsEmulatorURL()
+
+        guard let channel = assetsReleaseChannel(
+            emulatorURL: emulatorURL
+        ) else {
+
+            renderAssetsUnavailable(
+                "Install 86Box first"
+            )
+
+            return
+        }
+
+        assetsBusy = true
+
+        let emulatorButtonWasEnabled =
+            emulatorUpdateButton.isEnabled
+
+                emulatorUpdateButton.isEnabled = false
+
+        let progressID = UUID()
+
+        assetsDownloadProgressID = progressID
+
+        // Preserve the existing subtitle while the
+        // circular download progress indicator is visible.
+        renderAssetsProgress(nil)
+
+        Task { @MainActor in
+
+            defer {
+
+                self.assetsDownloadProgressID = nil
+                self.assetsBusy = false
+
+                self.emulatorUpdateButton.isEnabled =
+                    emulatorButtonWasEnabled
+
+                self.refreshAssetsStatus(
+                    preserveStatusText: true
+                )
+            }
+
+            do {
+
+                // Revalidate the selected update before installing.
+                let latestStatus =
+                    try await AssetsInstaller.checkForUpdate(
+                        channel: channel,
+                        emulatorURL: emulatorURL
+                    )
+
+                guard latestStatus == status else {
+                    return
+                }
+
+                    let previousAssets =
+                    try await AssetsInstaller.downloadAndInstall(
+                        latestStatus,
+                        progress: { [weak self] fraction in
+
+                            DispatchQueue.main.async {
+
+                                guard let self = self,
+                                      self.assetsDownloadProgressID
+                                        == progressID else {
+
+                                    return
+                                }
+
+                                self.renderAssetsDownloadProgress(
+                                    fraction
+                                )
+                            }
+                        }
+                    )
+
+                // The transaction has completed successfully.
+                // Remove the previous installation only after
+                // verifying the newly installed revision.
+                if let previousAssets = previousAssets {
+
+                    do {
+
+                        try AssetsInstaller.removeVerifiedUpdateBackup(
+                            previousAssets,
+                            for: latestStatus
+                        )
+
+                    } catch {
+
+                        // Cleanup failure must not turn a
+                        // successful installation into a failure.
+                        NSLog(
+                            "MacBox: Assets backup cleanup failed: %@",
+                            error.localizedDescription
+                        )
+                    }
+                }
+
+            } catch {
+
+                let alert = NSAlert()
+
+                alert.alertStyle = .warning
+                alert.messageText =
+                    "86Box Assets installation failed"
+
+                alert.informativeText =
+                    error.localizedDescription
+
+                alert.runModal()
+            }
+        }
+
+        #endif
+    }
+
+    // MARK: - 86Box Assets status
+
+    private func assetsEmulatorURL() -> URL? {
+
+        if let updatedURL = assetsUpdatedEmulatorURL {
+            return updatedURL.standardizedFileURL
+        }
+
+        let candidate: URL
+
+        #if MACBOX_RELEASE_TEST
+
+        candidate = FileManager.default
+            .homeDirectoryForCurrentUser
+            .appendingPathComponent(
+                "MacBox-ReleaseTest/86Box.app",
+                isDirectory: true
+            )
+
+        #elseif DEBUG
+
+        candidate = FileManager.default
+            .homeDirectoryForCurrentUser
+            .appendingPathComponent(
+                "MacBox-Dev/86Box.app",
+                isDirectory: true
+            )
+
+        #else
+
+        let versionInfoObject =
+            MainViewController.instance.versionInfoObject
+
+        candidate = versionInfoObject.emulatorCustomUrl
+            ?? versionInfoObject.emulatorAutoUrl
+            ?? homeDirURL.appendingPathComponent(
+                "86Box.app",
+                isDirectory: true
+            )
+
+        #endif
+
+        guard let bundle = Bundle(url: candidate),
+              bundle.bundleIdentifier == "net.86Box.86Box" else {
+            return nil
+        }
+
+        return candidate.standardizedFileURL
+    }
+
+    private func assetsReleaseChannel(
+        emulatorURL: URL?
+    ) -> AssetsRelease.Channel? {
+
+        if !isStableChannel {
+            return .experimental
+        }
+
+        guard let emulatorURL = emulatorURL else {
+            return nil
+        }
+
+        // Read the installed application's Info.plist directly.
+        // Bundle metadata may be cached following app replacement.
+        let infoPlistURL = emulatorURL.appendingPathComponent(
+            "Contents/Info.plist"
+        )
+
+        guard let data = try? Data(contentsOf: infoPlistURL),
+              let info = (
+                try? PropertyListSerialization.propertyList(
+                    from: data,
+                    options: [],
+                    format: nil
+                )
+              ) as? [String: Any],
+              let version = info["CFBundleShortVersionString"] as? String,
+              !version.isEmpty else {
+            return nil
+        }
+
+        return .stable(version: version)
+    }
+
+    private func renderAssetsStatus(
+        _ status: AssetsInstaller.UpdateStatus
+    ) {
+
+        assetsStatus = status
+
+        assetsUpdateProgressIndicator.stopAnimation(nil)
+        assetsUpdateProgressIndicator.isHidden = true
+
+        assetsUpdateButton.isHidden = true
+        assetsUpdateButton.isEnabled = false
+        assetsUpdateCheckImageView.isHidden = true
+        assetsUpdateStatusTextField.toolTip = nil
+
+        switch status {
+
+        case .install:
+
+            assetsUpdateStatusTextField.stringValue =
+                "Not installed"
+
+            assetsUpdateButton.title = NSLocalizedString(
+                "Install",
+                comment: ""
+            )
+
+            assetsUpdateButton.isHidden = false
+            assetsUpdateButton.isEnabled = true
+
+        case .update:
+
+            assetsUpdateStatusTextField.stringValue =
+                "Update available"
+
+            assetsUpdateButton.title = NSLocalizedString(
+                "Update",
+                comment: ""
+            )
+
+            assetsUpdateButton.isHidden = false
+            assetsUpdateButton.isEnabled = true
+
+        case .current:
+
+            assetsUpdateStatusTextField.stringValue =
+                "Up to date"
+
+            assetsUpdateCheckImageView.isHidden = false
+
+        case .bundled(let url):
+
+            assetsUpdateStatusTextField.stringValue =
+                "Included with 86Box"
+
+            assetsUpdateStatusTextField.toolTip = url.path
+
+        case .externallyInstalled(let url):
+
+            assetsUpdateStatusTextField.stringValue =
+                "Installed externally"
+
+            assetsUpdateStatusTextField.toolTip = url.path
+        }
+    }
+
+    private func renderAssetsUnavailable(
+        _ message: String,
+        detail: String? = nil
+    ) {
+
+        assetsStatus = nil
+
+        assetsUpdateButton.isHidden = true
+        assetsUpdateButton.isEnabled = false
+        assetsUpdateCheckImageView.isHidden = true
+
+        assetsUpdateProgressIndicator.stopAnimation(nil)
+        assetsUpdateProgressIndicator.isHidden = true
+
+        assetsUpdateStatusTextField.stringValue = message
+        assetsUpdateStatusTextField.toolTip = detail
+    }
+
+        private func renderAssetsProgress(
+        _ message: String?
+    ) {
+
+        assetsUpdateButton.isHidden = true
+        assetsUpdateButton.isEnabled = false
+        assetsUpdateCheckImageView.isHidden = true
+
+        if let message = message {
+
+            assetsUpdateStatusTextField.stringValue = message
+            assetsUpdateStatusTextField.toolTip = nil
+        }
+
+        assetsUpdateProgressIndicator.stopAnimation(nil)
+
+        assetsUpdateProgressIndicator.style = .spinning
+        assetsUpdateProgressIndicator.isIndeterminate = true
+        assetsUpdateProgressIndicator.isDisplayedWhenStopped = true
+
+        assetsUpdateProgressIndicator.minValue = 0
+        assetsUpdateProgressIndicator.maxValue = 100
+        assetsUpdateProgressIndicator.doubleValue = 0
+
+        assetsUpdateProgressIndicator.isHidden = false
+        assetsUpdateProgressIndicator.startAnimation(nil)
+    }
+
+    private func renderAssetsDownloadProgress(
+        _ fraction: Double?
+    ) {
+
+        guard let fraction = fraction else {
+
+            if !assetsUpdateProgressIndicator.isIndeterminate {
+
+                assetsUpdateProgressIndicator.isIndeterminate = true
+                assetsUpdateProgressIndicator.startAnimation(nil)
+            }
+
+            return
+        }
+
+        if assetsUpdateProgressIndicator.isIndeterminate {
+
+            assetsUpdateProgressIndicator.stopAnimation(nil)
+            assetsUpdateProgressIndicator.isIndeterminate = false
+        }
+
+        assetsUpdateProgressIndicator.doubleValue =
+            min(max(fraction, 0), 1) * 100
+
+        assetsUpdateProgressIndicator.isHidden = false
+    }
+
+    private func refreshAssetsStatus(
+        preserveStatusText: Bool = false
+    ) {
+
+        guard !assetsBusy else {
+            assetsRefreshPending = true
+            return
+        }
+
+        assetsRefreshPending = false
+
+        #if DEBUG && !MACBOX_RELEASE_TEST
+
+        renderAssetsUnavailable(
+            "Disabled in Debug builds"
+        )
+
+        return
+
+        #else
+
+        let emulatorURL = assetsEmulatorURL()
+
+        guard let channel = assetsReleaseChannel(
+            emulatorURL: emulatorURL
+        ) else {
+
+            renderAssetsUnavailable(
+                "Install 86Box first"
+            )
+
+            return
+        }
+
+        assetsBusy = true
+        assetsStatus = nil
+
+                renderAssetsProgress(
+            preserveStatusText
+                ? nil
+                : "Checking for updates..."
+        )
+
+        Task { @MainActor in
+
+            defer {
+                self.assetsBusy = false
+
+                if self.assetsRefreshPending {
+                    self.refreshAssetsStatus()
+                }
+            }
+
+            do {
+
+                let status =
+                    try await AssetsInstaller.checkForUpdate(
+                        channel: channel,
+                        emulatorURL: emulatorURL
+                    )
+
+                                guard !self.assetsRefreshPending else {
+                    return
+                }
+
+                self.renderAssetsStatus(status)
+
+            } catch {
+
+                guard !self.assetsRefreshPending else {
+                    return
+                }
+
+                self.renderAssetsUnavailable(
+                    "Unable to check",
+                    detail: error.localizedDescription
+                )
+
+                NSLog(
+                    "MacBox Assets check failed: %@",
+                    error.localizedDescription
+                )
+            }
+        }
+
+        #endif
+    }
 
     // Populate 86Box update info
     private func populateEmulatorUpdateInfo() {
@@ -695,6 +1174,16 @@ class VersionManagerViewController: NSViewController {
                 appVersion,
                 buildVersion
             )
+
+            // Refresh Assets compatibility and installation status
+            // using the newly installed emulator.
+            assetsUpdatedEmulatorURL = installationURL
+
+            NSLog(
+                "MacBox: Refreshing 86Box Assets after emulator installation."
+            )
+
+            refreshAssetsStatus()
 
         } catch {
             NSLog(

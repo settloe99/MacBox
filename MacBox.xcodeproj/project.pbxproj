@@ -13,6 +13,8 @@
 		F934D58B29E41BDB00F0D450 /* AddVMViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = F934D58A29E41BDB00F0D450 /* AddVMViewController.swift */; };
 		F934D58D29E424EE00F0D450 /* VM.swift in Sources */ = {isa = PBXBuildFile; fileRef = F934D58C29E424EE00F0D450 /* VM.swift */; };
 		898414C92D9F4EE68BDF0F06 /* VMStorageRelocation.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA3CEF47A8DD4088BADBA826 /* VMStorageRelocation.swift */; };
+		B480A53B4D3940A2BFBDAB62 /* AssetsInstaller.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6D87682F5C91489E9F8E8E97 /* AssetsInstaller.swift */; };
+		C5941EE3461E4C85995FA64B /* AssetsRelease.swift in Sources */ = {isa = PBXBuildFile; fileRef = DB970811CCA34C019A836F7F /* AssetsRelease.swift */; };
 		F944ACA12B55BF230048455C /* VersionManagerViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = F944ACA02B55BF230048455C /* VersionManagerViewController.swift */; };
 		F95C5A682BF93026004BE8E9 /* ScreensaverManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = F95C5A672BF93026004BE8E9 /* ScreensaverManager.swift */; };
 		F95DC0462B4BD2BB006ECF05 /* GithubResponseObject.swift in Sources */ = {isa = PBXBuildFile; fileRef = F95DC0452B4BD2BB006ECF05 /* GithubResponseObject.swift */; };
@@ -43,6 +45,8 @@
 		F934D58A29E41BDB00F0D450 /* AddVMViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AddVMViewController.swift; sourceTree = "<group>"; };
 		F934D58C29E424EE00F0D450 /* VM.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VM.swift; sourceTree = "<group>"; };
 		FA3CEF47A8DD4088BADBA826 /* VMStorageRelocation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VMStorageRelocation.swift; sourceTree = "<group>"; };
+		6D87682F5C91489E9F8E8E97 /* AssetsInstaller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AssetsInstaller.swift; sourceTree = "<group>"; };
+		DB970811CCA34C019A836F7F /* AssetsRelease.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AssetsRelease.swift; sourceTree = "<group>"; };
 		F944ACA02B55BF230048455C /* VersionManagerViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VersionManagerViewController.swift; sourceTree = "<group>"; };
 		F95C5A672BF93026004BE8E9 /* ScreensaverManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreensaverManager.swift; sourceTree = "<group>"; };
 		F95DC0452B4BD2BB006ECF05 /* GithubResponseObject.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GithubResponseObject.swift; sourceTree = "<group>"; };
@@ -86,6 +90,8 @@
 				4BD18D2730AB98E400C5E27A /* EmulatorIntegrity.swift */,
 				F934D58C29E424EE00F0D450 /* VM.swift */,
 				FA3CEF47A8DD4088BADBA826 /* VMStorageRelocation.swift */,
+				6D87682F5C91489E9F8E8E97 /* AssetsInstaller.swift */,
+				DB970811CCA34C019A836F7F /* AssetsRelease.swift */,
 				F9BB907529F14C7E000B4C5F /* VMTemplate.swift */,
 				F9DC6A4129F874770076FC50 /* SpecsParser.swift */,
 				F92DF7CD2A00021800450E04 /* RunningVMProcess.swift */,
@@ -312,6 +318,8 @@
 				F9D3370F2B6A8DD500CE75A0 /* URL.swift in Sources */,
 				F934D58D29E424EE00F0D450 /* VM.swift in Sources */,
 				898414C92D9F4EE68BDF0F06 /* VMStorageRelocation.swift in Sources */,
+				B480A53B4D3940A2BFBDAB62 /* AssetsInstaller.swift in Sources */,
+				C5941EE3461E4C85995FA64B /* AssetsRelease.swift in Sources */,
 				F95C5A682BF93026004BE8E9 /* ScreensaverManager.swift in Sources */,
 				F9F47FAF2B573444008EDF4E /* JenkinsResponseObject.swift in Sources */,
 				F9B09E6429E9DBC800C86A0F /* IniParser.swift in Sources */,
